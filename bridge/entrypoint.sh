@@ -125,7 +125,7 @@ trap cleanup SIGTERM SIGINT SIGHUP
 # Wait up to 60 s for Bridge's IMAP port (127.0.0.1:1143) to open.
 echo "[bridge] Waiting for IMAP listener..."
 for i in $(seq 1 60); do
-  if bash -c "echo > /dev/tcp/127.0.0.1/1143" 2>/dev/null; then
+  if bash -c "< /dev/tcp/127.0.0.1/1143" 2>/dev/null; then
     echo "[bridge] IMAP listener ready (${i}s)."
     break
   fi
@@ -139,8 +139,8 @@ done
 # socat proxy: 0.0.0.0:2143 → 127.0.0.1:1143  (IMAP, Docker maps host:1143→container:2143)
 # socat proxy: 0.0.0.0:2025 → 127.0.0.1:1025  (SMTP, Docker maps host:1025→container:2025)
 # Port numbers 2143/2025 differ from Bridge's 1143/1025 to avoid bind conflicts.
-socat TCP-LISTEN:2143,fork,reuseaddr TCP4:127.0.0.1:1143 &
-socat TCP-LISTEN:2025,fork,reuseaddr TCP4:127.0.0.1:1025 &
+socat TCP-LISTEN:2143,fork,reuseaddr TCP4:127.0.0.1:1143 2>/dev/null &
+socat TCP-LISTEN:2025,fork,reuseaddr TCP4:127.0.0.1:1025 2>/dev/null &
 echo "[bridge] socat proxies active (IMAP :2143→:1143  SMTP :2025→:1025)."
 
 wait "${BRIDGE_PID}"

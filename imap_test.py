@@ -12,8 +12,9 @@ Configuration (environment variables or .env file):
     BRIDGE_IMAP_PASS        Bridge-generated password
     BRIDGE_IMAP_SSL         "true" to use IMAP over SSL (port 993)
     BRIDGE_SKIP_TLS_VERIFY  "true" to accept Bridge's self-signed certificate
-    BRIDGE_FILTER_TO        show only messages where this address appears in
-                            To or Cc (substring match, case-insensitive)
+    BRIDGE_FILTER_TO        comma-separated addresses — show only messages where
+                            any of them appears in To or Cc.
+                            e.g. info@example.com,support@example.com
     BRIDGE_FETCH_LIMIT      max messages to display; 0 = all (default: 0)
 """
 
@@ -43,13 +44,31 @@ BRIDGE_USER  = os.environ.get("BRIDGE_IMAP_USER", "")
 BRIDGE_PASS  = os.environ.get("BRIDGE_IMAP_PASS", "")
 USE_SSL      = os.environ.get("BRIDGE_IMAP_SSL", "").lower() in ("1", "true", "yes")
 SKIP_TLS     = os.environ.get("BRIDGE_SKIP_TLS_VERIFY", "true").lower() in ("1", "true", "yes")
-FILTER_TO    = os.environ.get("BRIDGE_FILTER_TO", "").strip()
+FILTER_TO    = [a.strip() for a in os.environ.get("BRIDGE_FILTER_TO", "").split(",") if a.strip()]
 FETCH_LIMIT  = int(os.environ.get("BRIDGE_FETCH_LIMIT", "0"))  # 0 = all
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def recipient_criteria(addresses: List[str]) -> str:
+    """Build a nested IMAP OR search for multiple To/Cc addresses.
+
+    IMAP OR takes exactly two arguments, so three addresses become:
+        OR (OR (TO a CC a) (TO b CC b)) (TO c CC c)
+    """
+    clauses = [f'(OR TO "{a}" CC "{a}")' for a in addresses]
+    while len(clauses) > 1:
+        paired = []
+        for i in range(0, len(clauses), 2):
+            if i + 1 < len(clauses):
+                paired.append(f"(OR {clauses[i]} {clauses[i + 1]})")
+            else:
+                paired.append(clauses[i])
+        clauses = paired
+    return clauses[0]
+
 
 def die(msg: str) -> None:
     print(f"\nERROR: {msg}", file=sys.stderr)
@@ -153,8 +172,8 @@ def main() -> None:
 
     # -- Search ---------------------------------------------------------------
     if FILTER_TO:
-        criteria = f'(OR TO "{FILTER_TO}" CC "{FILTER_TO}")'
-        print(f"Filter: recipient contains '{FILTER_TO}'")
+        criteria = recipient_criteria(FILTER_TO)
+        print(f"Filter: {' | '.join(FILTER_TO)}")
     else:
         criteria = "ALL"
 
@@ -179,7 +198,7 @@ def main() -> None:
     display = messages if FETCH_LIMIT == 0 else messages[:FETCH_LIMIT]
 
     divider = "─" * 64
-    label = f"to/cc '{FILTER_TO}'" if FILTER_TO else "in INBOX"
+    label = f"to/cc {' | '.join(FILTER_TO)}" if FILTER_TO else "in INBOX"
     limit_note = f" (showing {len(display)})" if FETCH_LIMIT and len(messages) > FETCH_LIMIT else ""
     print(divider)
     print(f"  {len(messages)} message(s) {label}{limit_note} — newest first")
