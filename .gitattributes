@@ -1,0 +1,14 @@
+# Default: normalise to LF on checkout
+* text=auto eol=lf
+
+# Shell scripts must always be LF — CRLF breaks the Linux shebang interpreter
+*.sh text eol=lf
+
+# Windows-only files may use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files — no line-ending translation
+*.deb binary
+*.png binary
+*.jpg binary

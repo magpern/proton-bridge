@@ -1,0 +1,50 @@
+services:
+
+  # ── Proton Mail Bridge ──────────────────────────────────────────────────────
+  proton-bridge:
+    build:
+      context: ./bridge
+      args:
+        BRIDGE_VERSION: ${BRIDGE_VERSION:-3.24.2}
+    container_name: proton-bridge
+    restart: unless-stopped
+    volumes:
+      - bridge_config:/root/.config/protonmail
+      - bridge_gnupg:/root/.gnupg
+      - bridge_pass:/root/.password-store
+    networks:
+      - bridge-net
+    # No host port bindings — IMAP/SMTP are reachable only from bridge-net.
+    # The socat proxy inside the container exposes:
+    #   0.0.0.0:2143 → 127.0.0.1:1143  (IMAP)
+    #   0.0.0.0:2025 → 127.0.0.1:1025  (SMTP)
+    stdin_open: true
+    tty: true
+
+  # ── IMAP test client ────────────────────────────────────────────────────────
+  imap-client:
+    build:
+      context: .                   # project root (contains imap_test.py)
+      dockerfile: client/Dockerfile
+    container_name: imap-client
+    env_file:
+      - .env
+    networks:
+      - bridge-net
+    depends_on:
+      - proton-bridge
+    # Run once and exit; use `docker compose run --rm imap-client` to invoke.
+    restart: "no"
+    profiles:
+      - test                       # excluded from `docker compose up -d`
+
+networks:
+  bridge-net:
+    driver: bridge
+    # Not `internal: true` — proton-bridge needs internet to reach Proton servers.
+    # IMAP/SMTP isolation is achieved by having no published host ports.
+
+volumes:
+  bridge_config:
+  bridge_gnupg:
+  bridge_pass:
