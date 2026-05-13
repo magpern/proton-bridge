@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-worker.py — Proton Bridge → WordPress REST API mail worker
+worker.py — Proton Bridge IMAP → generic HTTP API mail worker
 
-Polls Proton Mail Bridge IMAP for UNSEEN messages, parses them, and POSTs
-each one to a WordPress custom REST API endpoint. Sends periodic heartbeats
-so the WordPress side can detect stalls.
+Polls Proton Mail Bridge IMAP for messages matching IMAP_SEARCH, parses each
+one, and POSTs it to a generic REST API. Sends a heartbeat after every cycle.
 
 Configuration (environment variables or .env file):
-    IMAP_HOST           Proton Bridge host (default: proton-bridge)
-    IMAP_PORT           socat proxy port  (default: 2143)
+    IMAP_HOST           Proton Bridge host          (default: proton-bridge)
+    IMAP_PORT           socat proxy port            (default: 2143)
     IMAP_USER           Bridge login — your Proton address
-    IMAP_PASS           Bridge-generated password (NOT your Proton password)
-    IMAP_MAILBOX        Mailbox to poll (default: INBOX)
-    IMAP_FILTER_TO      Comma-separated addresses — only messages where any
-                        of them appears in To or Cc.  Leave empty for all.
-    IMAP_MARK_SEEN      Mark imported messages as \\Seen (default: true)
-    WP_URL              WordPress base URL, e.g. https://example.com
-    WP_TOKEN            Bearer token for biopentra-support REST API
-    POLL_INTERVAL       Seconds between poll cycles (default: 60)
-    MESSAGE_CAP         Max messages to import per cycle; 0 = all (default: 20)
+    IMAP_PASS           Bridge-generated password
+    IMAP_MAILBOX        Mailbox to poll             (default: INBOX)
+    IMAP_SEARCH         IMAP search criteria        (default: UNSEEN)
+    MARK_SEEN           Mark imported messages Seen (default: true)
+    API_BASE_URL        REST API base, no trailing slash
+    API_TOKEN           Bearer token
+    POLL_INTERVAL       Seconds between cycles      (default: 300)
+    MESSAGE_CAP         Max messages per cycle; 0=all (default: 50)
+    WORKER_VERSION      Reported in heartbeat       (default: 1.0.0)
 """
 
 import email
 import email.header
 import email.message
 import email.utils
+import hashlib
 import imaplib
 import logging
 import os
+import re
 import signal
 import ssl
 import sys
@@ -44,22 +45,8 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Logging — set up before config so validation errors are formatted
 # ---------------------------------------------------------------------------
-IMAP_HOST     = os.environ.get("IMAP_HOST", "proton-bridge")
-IMAP_PORT     = int(os.environ.get("IMAP_PORT", "2143"))
-IMAP_USER     = os.environ.get("IMAP_USER", "")
-IMAP_PASS     = os.environ.get("IMAP_PASS", "")
-IMAP_MAILBOX  = os.environ.get("IMAP_MAILBOX", "INBOX")
-IMAP_FILTER   = [a.strip() for a in os.environ.get("IMAP_FILTER_TO", "").split(",") if a.strip()]
-MARK_SEEN     = os.environ.get("IMAP_MARK_SEEN", "true").lower() in ("1", "true", "yes")
-WP_URL        = os.environ.get("WP_URL", "").rstrip("/")
-WP_TOKEN      = os.environ.get("WP_TOKEN", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
-MESSAGE_CAP   = int(os.environ.get("MESSAGE_CAP", "20"))
-
-BASE_API      = f"{WP_URL}/wp-json/biopentra-support/v1"
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -69,14 +56,62 @@ log = logging.getLogger("worker")
 
 
 # ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+def _require(name: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        log.error("Missing required environment variable: %s", name)
+        sys.exit(1)
+    return val
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        log.error("Environment variable %s must be an integer, got: %r", name, raw)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+IMAP_HOST      = os.environ.get("IMAP_HOST", "proton-bridge")
+IMAP_PORT      = _int_env("IMAP_PORT", 2143)
+IMAP_USER      = _require("IMAP_USER")
+IMAP_PASS      = _require("IMAP_PASS")
+IMAP_MAILBOX   = os.environ.get("IMAP_MAILBOX", "INBOX")
+IMAP_SEARCH    = os.environ.get("IMAP_SEARCH", "UNSEEN")
+MARK_SEEN      = os.environ.get("MARK_SEEN", "true").lower() in ("1", "true", "yes")
+API_BASE_URL   = os.environ.get("API_BASE_URL", "").rstrip("/")
+API_TOKEN      = _require("API_TOKEN")
+POLL_INTERVAL  = _int_env("POLL_INTERVAL", 300)
+MESSAGE_CAP    = _int_env("MESSAGE_CAP", 50)
+WORKER_VERSION = os.environ.get("WORKER_VERSION", "1.0.0")
+
+if not API_BASE_URL:
+    log.error("Missing required environment variable: API_BASE_URL")
+    sys.exit(1)
+
+log.info("worker started")
+log.info("config loaded")
+log.info("poll interval: %s", POLL_INTERVAL)
+log.info("message cap: %s", MESSAGE_CAP)
+
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 _running = True
+
 
 def _stop(signum, frame):
     global _running
     log.info("Signal %s received — shutting down after current cycle.", signum)
     _running = False
+
 
 signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
@@ -85,7 +120,6 @@ signal.signal(signal.SIGINT, _stop)
 # ---------------------------------------------------------------------------
 # IMAP helpers
 # ---------------------------------------------------------------------------
-
 def _tls_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -94,47 +128,38 @@ def _tls_context() -> ssl.SSLContext:
 
 
 def _connect() -> imaplib.IMAP4:
-    log.debug("Connecting to %s:%s", IMAP_HOST, IMAP_PORT)
     conn = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
     try:
         conn.starttls(ssl_context=_tls_context())
     except imaplib.IMAP4.error as exc:
         log.warning("STARTTLS unavailable (%s) — using plain connection.", exc)
     conn.login(IMAP_USER, IMAP_PASS)
+    log.info("imap connected")
     return conn
 
 
-def _recipient_criteria(addresses: List[str]) -> str:
-    """Build a nested IMAP OR search for multiple To/Cc addresses."""
-    clauses = [f'(OR TO "{a}" CC "{a}")' for a in addresses]
-    while len(clauses) > 1:
-        paired = []
-        for i in range(0, len(clauses), 2):
-            if i + 1 < len(clauses):
-                paired.append(f"(OR {clauses[i]} {clauses[i + 1]})")
-            else:
-                paired.append(clauses[i])
-        clauses = paired
-    return clauses[0]
+def _get_uidvalidity(conn: imaplib.IMAP4) -> Optional[str]:
+    try:
+        _, data = conn.status(f'"{IMAP_MAILBOX}"', "(UIDVALIDITY)")
+        if data and data[0]:
+            m = re.search(r"UIDVALIDITY (\d+)", data[0].decode(errors="replace"))
+            if m:
+                return m.group(1)
+    except Exception as exc:
+        log.warning("Could not retrieve UIDVALIDITY: %s", exc)
+    return None
 
 
-def _search_unseen(conn: imaplib.IMAP4) -> List[bytes]:
-    if IMAP_FILTER:
-        recipient_clause = _recipient_criteria(IMAP_FILTER)
-        criteria = f"UNSEEN {recipient_clause}"
-    else:
-        criteria = "UNSEEN"
-    _, data = conn.search(None, criteria)
-    ids = data[0].split()
-    if MESSAGE_CAP > 0:
-        ids = ids[:MESSAGE_CAP]
-    return ids
+def _dedupe_key(folder: str, uidvalidity: Optional[str], uid: int) -> Optional[str]:
+    if not uidvalidity:
+        return None
+    raw = f"{folder.lower()}|{uidvalidity}|{uid}"
+    return hashlib.sha1(raw.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
 # Email parsing helpers
 # ---------------------------------------------------------------------------
-
 def _decode_header(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -148,6 +173,27 @@ def _decode_header(value: Optional[str]) -> str:
     return "".join(out)
 
 
+def _norm_msgid(value: Optional[str]) -> str:
+    """Lowercase, strip whitespace and angle brackets from a message ID."""
+    if not value:
+        return ""
+    return value.strip().strip("<>").lower()
+
+
+def _norm_references(value: Optional[str]) -> List[str]:
+    """Split References header into a list of normalized IDs."""
+    if not value:
+        return []
+    return [_norm_msgid(ref) for ref in re.split(r"\s+", value.strip()) if ref]
+
+
+def _first_email(header_value: Optional[str]) -> str:
+    if not header_value:
+        return ""
+    pairs = email.utils.getaddresses([header_value])
+    return pairs[0][1] if pairs else ""
+
+
 def _parse_date(msg: email.message.Message) -> str:
     raw = msg.get("Date", "")
     try:
@@ -157,21 +203,13 @@ def _parse_date(msg: email.message.Message) -> str:
         return datetime.now(timezone.utc).isoformat()
 
 
-def _address_list(header_value: Optional[str]) -> List[str]:
-    if not header_value:
-        return []
-    return [f"{name} <{addr}>".strip() if name else addr
-            for name, addr in email.utils.getaddresses([header_value])]
-
-
 def _extract_bodies(msg: email.message.Message) -> Tuple[str, str]:
-    """Return (plain_text, html) extracted from a (potentially MIME) message."""
-    plain, html = [], []
+    plain: List[str] = []
+    html:  List[str] = []
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
-            cd = part.get("Content-Disposition", "")
-            if "attachment" in cd:
+            if "attachment" in part.get("Content-Disposition", ""):
                 continue
             payload = part.get_payload(decode=True)
             if payload is None:
@@ -194,146 +232,216 @@ def _extract_bodies(msg: email.message.Message) -> Tuple[str, str]:
     return "\n".join(plain), "\n".join(html)
 
 
-def _build_payload(raw_bytes: bytes) -> dict:
+def _raw_headers(msg: email.message.Message) -> str:
+    return "".join(f"{k}: {v}\r\n" for k, v in msg.items())
+
+
+def _build_payload(raw_bytes: bytes, uid: int, uidvalidity: Optional[str]) -> dict:
     msg = email.message_from_bytes(raw_bytes)
     plain, html = _extract_bodies(msg)
-    from_pairs = email.utils.parseaddr(_decode_header(msg.get("From")))
+    from_name, from_email = email.utils.parseaddr(_decode_header(msg.get("From")))
     return {
-        "message_id":  msg.get("Message-ID", ""),
-        "in_reply_to": msg.get("In-Reply-To", ""),
-        "references":  msg.get("References", ""),
-        "from_email":  from_pairs[1],
-        "from_name":   from_pairs[0],
-        "to":          _address_list(msg.get("To")),
-        "cc":          _address_list(msg.get("Cc")),
-        "subject":     _decode_header(msg.get("Subject")),
-        "body_text":   plain,
-        "body_html":   html,
-        "date":        _parse_date(msg),
+        "message_id":       _norm_msgid(msg.get("Message-ID")),
+        "in_reply_to":      _norm_msgid(msg.get("In-Reply-To")) or None,
+        "references":       _norm_references(msg.get("References")),
+        "imap_folder":      IMAP_MAILBOX,
+        "imap_uidvalidity": uidvalidity,
+        "imap_uid":         uid,
+        "imap_dedupe_key":  _dedupe_key(IMAP_MAILBOX, uidvalidity, uid),
+        "from_email":       from_email,
+        "from_name":        from_name,
+        "to_email":         _first_email(msg.get("To")),
+        "subject":          _decode_header(msg.get("Subject")),
+        "date":             _parse_date(msg),
+        "body_text":        plain,
+        "body_html":        html,
+        "raw_headers":      _raw_headers(msg),
     }
 
 
 # ---------------------------------------------------------------------------
-# WordPress REST API helpers
+# API helpers
 # ---------------------------------------------------------------------------
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"}
 
-def _headers() -> dict:
-    return {"Authorization": f"Bearer {WP_TOKEN}", "Content-Type": "application/json"}
 
-
-def _post_message(payload: dict) -> bool:
-    url = f"{BASE_API}/messages/import"
+def _health_check() -> bool:
+    url = f"{API_BASE_URL}/health"
     try:
-        resp = requests.post(url, json=payload, headers=_headers(), timeout=15)
-        if resp.status_code in (200, 201):
-            log.info("Imported message_id=%s subject=%r", payload["message_id"], payload["subject"])
+        resp = requests.get(url, headers=_auth_headers(), timeout=10)
+        if resp.status_code == 200:
+            log.info("api health ok")
             return True
-        log.warning("POST %s → HTTP %s: %s", url, resp.status_code, resp.text[:200])
+        log.warning("Health check %s → HTTP %s", url, resp.status_code)
         return False
+    except requests.RequestException as exc:
+        log.warning("Health check failed: %s", exc)
+        return False
+
+
+def _import_message(payload: dict) -> str:
+    """
+    POST one message to the import endpoint.
+    Returns 'imported' | 'skipped_duplicate' | 'error'.
+    """
+    url = f"{API_BASE_URL}/messages/import"
+    try:
+        resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
+        if resp.status_code in (200, 201):
+            status = resp.json().get("status", "")
+            if status in ("imported", "skipped_duplicate"):
+                log.info("%s  message_id=%s  subject=%r", status, payload["message_id"], payload["subject"])
+                return status
+            log.warning("Unexpected API status %r for message_id=%s", status, payload["message_id"])
+            return "error"
+        if resp.status_code in (400, 401):
+            log.error("POST %s → HTTP %s (not retrying): %s", url, resp.status_code, resp.text[:200])
+            return "error"
+        log.warning("POST %s → HTTP %s (will retry): %s", url, resp.status_code, resp.text[:200])
+        return "error"
+    except requests.Timeout:
+        log.warning("POST %s timed out (will retry)", url)
+        return "error"
     except requests.RequestException as exc:
         log.error("POST %s failed: %s", url, exc)
-        return False
+        return "error"
 
 
-def _send_heartbeat(ok: bool, imported: int, errors: int) -> None:
-    url = f"{BASE_API}/worker/status"
+def _send_status(
+    last_poll_status: str,
+    imported: int,
+    skipped: int,
+    errors: int,
+    last_error: Optional[str],
+) -> None:
+    url = f"{API_BASE_URL}/worker/status"
     body = {
-        "status":   "ok" if ok else "error",
-        "imported": imported,
-        "errors":   errors,
-        "ts":       datetime.now(timezone.utc).isoformat(),
+        "worker_version":   WORKER_VERSION,
+        "heartbeat_at":     datetime.now(timezone.utc).isoformat(),
+        "last_poll_status": last_poll_status,
+        "imported":         imported,
+        "skipped":          skipped,
+        "errors":           errors,
+        "last_error":       last_error,
     }
     try:
-        resp = requests.post(url, json=body, headers=_headers(), timeout=10)
+        resp = requests.post(url, json=body, headers=_auth_headers(), timeout=10)
         if resp.status_code not in (200, 201):
-            log.warning("Heartbeat %s → HTTP %s", url, resp.status_code)
+            log.warning("Status POST %s → HTTP %s", url, resp.status_code)
     except requests.RequestException as exc:
-        log.warning("Heartbeat failed: %s", exc)
+        log.warning("Status POST failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
 # Poll cycle
 # ---------------------------------------------------------------------------
+def poll_once() -> Tuple[int, int, int, Optional[str]]:
+    """
+    Connect, fetch up to MESSAGE_CAP matching messages, import each one.
+    Returns (imported, skipped, errors, last_error).
+    """
+    imported = skipped = errors = 0
+    last_error: Optional[str] = None
 
-def poll_once() -> Tuple[int, int]:
-    """Connect, import UNSEEN messages, return (imported, errors)."""
-    imported, errors = 0, 0
     conn = _connect()
     try:
         conn.select(IMAP_MAILBOX)
-        ids = _search_unseen(conn)
-        if not ids:
-            log.info("No new messages.")
-            return 0, 0
+        log.info("mailbox selected: %s", IMAP_MAILBOX)
 
-        log.info("Found %d unseen message(s).", len(ids))
-        id_str = b",".join(ids)
-        _, data = conn.fetch(id_str, "(RFC822)")
+        uidvalidity = _get_uidvalidity(conn)
 
-        for item in data or []:
-            if not isinstance(item, tuple):
-                continue
+        # UID SEARCH returns UIDs, not sequence numbers
+        _, data = conn.uid("SEARCH", None, IMAP_SEARCH)
+        all_uids: List[bytes] = data[0].split()
+
+        if not all_uids:
+            log.info("no new messages")
+            return 0, 0, 0, None
+
+        total = len(all_uids)
+        batch = all_uids[:MESSAGE_CAP] if MESSAGE_CAP > 0 else all_uids
+        log.info("found %d messages", total)
+        log.info("processing %d messages", len(batch))
+
+        uid_str = b",".join(batch)
+        _, fetch_data = conn.uid("FETCH", uid_str, "(RFC822)")
+
+        # Match fetch responses to UIDs by position — Proton Bridge does not
+        # echo UID back in the FETCH response body even when requested.
+        message_tuples = [item for item in (fetch_data or []) if isinstance(item, tuple)]
+
+        for uid_bytes, item in zip(batch, message_tuples):
+            uid_int = int(uid_bytes)
+
             try:
-                payload = _build_payload(item[1])
+                payload = _build_payload(item[1], uid_int, uidvalidity)
             except Exception as exc:
-                log.error("Failed to parse message: %s", exc)
+                log.error("Failed to parse message UID %s: %s", uid_int, exc)
                 errors += 1
+                last_error = str(exc)
                 continue
 
-            success = _post_message(payload)
-            if success:
-                imported += 1
+            result = _import_message(payload)
+
+            if result in ("imported", "skipped_duplicate"):
+                if result == "imported":
+                    imported += 1
+                else:
+                    skipped += 1
                 if MARK_SEEN:
-                    # Extract the sequence number from the fetch response header
-                    # item[0] is e.g. b"1 (RFC822 {12345})"
-                    seq = item[0].split()[0]
-                    conn.store(seq, "+FLAGS", "\\Seen")
+                    conn.uid("STORE", str(uid_int).encode(), "+FLAGS", "\\Seen")
             else:
                 errors += 1
+                last_error = f"import_error uid={uid_int}"
+
     finally:
         try:
             conn.logout()
         except Exception:
             pass
 
-    return imported, errors
+    return imported, skipped, errors, last_error
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-
 def main() -> None:
-    missing = [v for v in ("IMAP_USER", "IMAP_PASS", "WP_URL", "WP_TOKEN") if not os.environ.get(v)]
-    if missing:
-        log.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
-
-    log.info(
-        "Worker started. IMAP=%s:%s mailbox=%s filter=%s poll=%ss cap=%s mark_seen=%s",
-        IMAP_HOST, IMAP_PORT, IMAP_MAILBOX,
-        IMAP_FILTER or "ALL", POLL_INTERVAL, MESSAGE_CAP or "unlimited", MARK_SEEN,
-    )
-
     while _running:
-        cycle_ok = True
-        imported = errors = 0
-        try:
-            imported, errors = poll_once()
-        except Exception as exc:
-            log.error("Poll cycle failed: %s", exc)
-            cycle_ok = False
-            errors = 1
+        poll_status = "ok"
+        imported = skipped = errors = 0
+        last_error: Optional[str] = None
 
-        _send_heartbeat(cycle_ok and errors == 0, imported, errors)
+        # 1. Health check
+        if not _health_check():
+            log.warning("API unavailable — skipping poll cycle.")
+            _send_status("api_unavailable", 0, 0, 0, "health_check_failed")
+        else:
+            # 2–4. IMAP → search → process
+            try:
+                imported, skipped, errors, last_error = poll_once()
+                if errors:
+                    poll_status = "partial_error"
+            except imaplib.IMAP4.error as exc:
+                log.error("IMAP error: %s", exc)
+                poll_status = "imap_error"
+                last_error = str(exc)
+            except Exception as exc:
+                log.error("Poll cycle failed: %s", exc)
+                poll_status = "error"
+                last_error = str(exc)
 
-        # Sleep in short chunks so SIGTERM is handled promptly.
+            # 5. Heartbeat
+            _send_status(poll_status, imported, skipped, errors, last_error)
+
+        # 6. Sleep in 1 s chunks so SIGTERM is handled promptly
         for _ in range(POLL_INTERVAL):
             if not _running:
                 break
             time.sleep(1)
 
-    log.info("Worker stopped.")
+    log.info("worker stopped")
 
 
 if __name__ == "__main__":
