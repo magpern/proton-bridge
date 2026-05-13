@@ -46,11 +46,15 @@ jobs:
             VER="${{ github.event.inputs.bridge_version }}"
             SOURCE="workflow_dispatch"
           elif [[ "${{ github.ref_type }}" == "tag" ]]; then
-            # 2. Git tag — strip leading 'v': v3.25.0 → 3.25.0
-            #    The tag IS the Bridge version, so pushing v3.25.0 installs Bridge 3.25.0.
-            VER="${{ github.ref_name }}"
-            VER="${VER#v}"
-            SOURCE="git tag (${{ github.ref_name }})"
+            # 2. Git tag — format: v<bridge-version>-<wrapper-patch>
+            #    e.g. v3.24.2-1  →  Bridge 3.24.2  (wrapper patch 1)
+            #         v3.24.2-2  →  Bridge 3.24.2  (wrapper patch 2, bug fix)
+            #         v3.25.0-1  →  Bridge 3.25.0
+            #    Strip leading 'v' and drop the wrapper patch suffix.
+            RAW="${{ github.ref_name }}"   # e.g. v3.24.2-1
+            RAW="${RAW#v}"                 # → 3.24.2-1
+            VER="${RAW%-*}"                # → 3.24.2  (drop -<patch>)
+            SOURCE="git tag (${{ github.ref_name }}) → Bridge ${VER}"
           else
             # 3. Branch push — fall back to .env.example (useful for testing main)
             VER="$(grep -E '^BRIDGE_VERSION=' .env.example | cut -d= -f2 | tr -d '[:space:]')"
