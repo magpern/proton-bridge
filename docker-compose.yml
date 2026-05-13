@@ -2,10 +2,11 @@ services:
 
   # ── Proton Mail Bridge ──────────────────────────────────────────────────────
   proton-bridge:
-    build:
-      context: ./bridge
-      args:
-        BRIDGE_VERSION: ${BRIDGE_VERSION:-3.24.2}
+    image: ghcr.io/magpern/proton-bridge:latest
+ #   build:
+ #     context: ./bridge
+ #     args:
+ #       BRIDGE_VERSION: ${BRIDGE_VERSION:-3.24.2}
     container_name: proton-bridge
     restart: unless-stopped
     volumes:
@@ -24,8 +25,7 @@ services:
   # ── IMAP test client ────────────────────────────────────────────────────────
   imap-client:
     build:
-      context: .                   # project root (contains imap_test.py)
-      dockerfile: client/Dockerfile
+      context: ./client
     container_name: imap-client
     env_file:
       - .env
@@ -37,6 +37,21 @@ services:
     restart: "no"
     profiles:
       - test                       # excluded from `docker compose up -d`
+
+  # ── Mail worker ─────────────────────────────────────────────────────────────
+  mail-worker:
+    build:
+      context: ./worker
+    container_name: mail-worker
+    env_file:
+      - .env
+    networks:
+      - bridge-net
+    depends_on:
+      - proton-bridge
+    restart: unless-stopped
+    profiles:
+      - worker                     # excluded from `docker compose up -d`
 
 networks:
   bridge-net:

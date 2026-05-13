@@ -195,6 +195,104 @@ docker exec wordpress wp --allow-root cron event run proton_fetch
 
 ---
 
+## Mail worker (Proton → WordPress REST API)
+
+WordPress no longer supports the PHP `imap` extension. The `mail-worker` service is a Python container that polls Proton Bridge IMAP and POSTs each unseen message to a WordPress custom REST API, replacing PHP IMAP entirely.
+
+### Architecture
+
+```
+Proton Mail Bridge (IMAP :2143 on bridge-net)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  mail-worker container          │
+│  • polls IMAP every POLL_INTERVAL│
+│  • parses MIME                  │
+│  • POSTs to WordPress REST API  │
+│  • sends heartbeat              │
+└─────────────────────────────────┘
+        │
+        │  HTTPS  Bearer <WP_TOKEN>
+        ▼
+WordPress REST API
+  POST /wp-json/biopentra-support/v1/messages/import
+  POST /wp-json/biopentra-support/v1/worker/status
+```
+
+### Add the worker to your stack
+
+```yaml
+# docker-compose.yml (already included — start it with --profile worker)
+services:
+  mail-worker:
+    build:
+      context: ./worker
+    env_file:
+      - .env
+    networks:
+      - bridge-net
+    depends_on:
+      - proton-bridge
+    restart: unless-stopped
+    profiles:
+      - worker
+```
+
+```bash
+# Start Bridge + worker together
+docker compose --profile worker up -d
+
+# Logs
+docker logs -f mail-worker
+```
+
+### Required `.env` variables for the worker
+
+| Variable | Description |
+|---|---|
+| `IMAP_HOST` | `proton-bridge` (Docker service name) |
+| `IMAP_PORT` | `2143` |
+| `IMAP_USER` | Your Proton address |
+| `IMAP_PASS` | Bridge-generated password (from `info` in CLI) |
+| `WP_URL` | WordPress base URL, e.g. `https://example.com` |
+| `WP_TOKEN` | Bearer token for the REST API |
+| `POLL_INTERVAL` | Seconds between polls (default: `60`) |
+| `MESSAGE_CAP` | Max messages per cycle, `0` = all (default: `20`) |
+| `IMAP_FILTER_TO` | Comma-separated To/Cc addresses to filter (optional) |
+| `IMAP_MARK_SEEN` | Mark imported messages as Seen (default: `true`) |
+
+### Message payload (POST body)
+
+```json
+{
+  "message_id":  "<unique-id@proton.me>",
+  "in_reply_to": "",
+  "references":  "",
+  "from_email":  "sender@example.com",
+  "from_name":   "Sender Name",
+  "to":          ["recipient@example.com"],
+  "cc":          [],
+  "subject":     "Hello",
+  "body_text":   "Plain text body",
+  "body_html":   "<p>HTML body</p>",
+  "date":        "2026-05-13T10:00:00+00:00"
+}
+```
+
+### Heartbeat payload (POST body)
+
+```json
+{
+  "status":   "ok",
+  "imported": 3,
+  "errors":   0,
+  "ts":       "2026-05-13T10:01:00+00:00"
+}
+```
+
+---
+
 ## First-time login
 
 > **This step requires a human.** Bridge must be authenticated with a Proton account before any IMAP connection will succeed. It cannot be automated — Proton requires interactive login with a password and optional 2FA.

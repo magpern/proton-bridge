@@ -1,20 +1,21 @@
-name: Build and publish Bridge image
+name: Build and publish images
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
     paths:
-      # Only these files affect the built image — everything else
-      # (README.md, imap_test.py, client/**, etc.) is intentionally
-      # excluded so documentation edits don't trigger a build.
+      # Trigger only when image source files change.
+      # README.md, imap_test.py, client/**, etc. intentionally excluded.
       - "bridge/**"
+      - "worker/**"
       - ".env.example"
       - ".github/workflows/bridge.yml"
   pull_request:
     branches: [main]
     paths:
       - "bridge/**"
+      - "worker/**"
       - ".env.example"
       - ".github/workflows/bridge.yml"
   workflow_dispatch:
@@ -26,10 +27,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/proton-bridge
 
 jobs:
-  build:
+
+  # ── Proton Mail Bridge image ────────────────────────────────────────────────
+  build-bridge:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,8 +41,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # ── Resolve Bridge version ────────────────────────────────────────────
-      # Priority: workflow_dispatch input → .env.example → fail
+      # ── Resolve Bridge version ──────────────────────────────────────────────
+      # Priority: workflow_dispatch input → git tag → .env.example
       - name: Resolve Bridge version
         id: version
         run: |
@@ -72,11 +74,10 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "### Bridge version: \`$VER\` (source: $SOURCE)" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Docker Buildx ────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # ── Registry login (tagged builds only) ──────────────────────────────
+      # ── Registry login (tagged builds only) ────────────────────────────────
       - name: Log in to GitHub Container Registry
         if: github.ref_type == 'tag'
         uses: docker/login-action@v4
@@ -85,7 +86,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Image tags & labels ───────────────────────────────────────────────
+      # ── Image tags & labels ─────────────────────────────────────────────────
       # Tagged builds produce:
       #   v3.24.2-1 → ghcr.io/owner/proton-bridge:3.24.2
       #               ghcr.io/owner/proton-bridge:3.24
@@ -95,7 +96,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/proton-bridge
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -106,7 +107,7 @@ jobs:
             org.opencontainers.image.vendor=Proton AG
             proton.bridge.version=${{ steps.version.outputs.version }}
 
-      # ── Build (and push if not a PR) ─────────────────────────────────────
+      # ── Build (and push on tagged commits only) ─────────────────────────────
       # The Dockerfile downloads the official amd64 .deb from GitHub releases,
       # so the image is linux/amd64 only.
       - name: Build and push
@@ -120,15 +121,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BRIDGE_VERSION=${{ steps.version.outputs.version }}
-          # GitHub Actions cache — reuses unchanged layers across runs
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=bridge
+          cache-to: type=gha,mode=max,scope=bridge
 
-      # ── Summary ──────────────────────────────────────────────────────────
       - name: Write job summary
         if: github.ref_type == 'tag'
         run: |
-          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Published Bridge image" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -136,5 +135,71 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Pull command:" >> "$GITHUB_STEP_SUMMARY"
           echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/proton-bridge:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Mail worker image ───────────────────────────────────────────────────────
+  build-worker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # ── Registry login (tagged builds only) ────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Image tags & labels ─────────────────────────────────────────────────
+      # Tagged builds produce:
+      #   v3.24.2-1 → ghcr.io/owner/proton-mail-worker:3.24.2-1
+      #               ghcr.io/owner/proton-mail-worker:latest
+      # Branch / PR builds: image is built but not pushed.
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/proton-mail-worker
+          tags: |
+            type=match,pattern=v(.+),group=1
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Proton Mail Worker
+            org.opencontainers.image.description=IMAP-to-WordPress REST API mail worker for Proton Bridge
+            org.opencontainers.image.vendor=Proton AG
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./worker
+          push: ${{ github.ref_type == 'tag' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - name: Write job summary
+        if: github.ref_type == 'tag'
+        run: |
+          echo "### Published worker image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pull command:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/proton-mail-worker:latest" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
