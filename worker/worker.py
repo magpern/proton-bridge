@@ -18,6 +18,7 @@ Configuration (environment variables or .env file):
     POLL_INTERVAL       Seconds between cycles      (default: 300)
     MESSAGE_CAP         Max messages per cycle; 0=all (default: 50)
     WORKER_VERSION      Reported in heartbeat       (default: 1.0.0)
+    WORKER_HTTP_PORT    Port for the trigger HTTP server (default: 9090)
 """
 
 import email
@@ -26,14 +27,17 @@ import email.message
 import email.utils
 import hashlib
 import imaplib
+import json
 import logging
 import os
 import re
 import signal
 import ssl
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Optional, Tuple
 
 import requests
@@ -87,9 +91,10 @@ IMAP_SEARCH    = os.environ.get("IMAP_SEARCH", "UNSEEN")
 MARK_SEEN      = os.environ.get("MARK_SEEN", "true").lower() in ("1", "true", "yes")
 API_BASE_URL   = os.environ.get("API_BASE_URL", "").rstrip("/")
 API_TOKEN      = _require("API_TOKEN")
-POLL_INTERVAL  = _int_env("POLL_INTERVAL", 300)
-MESSAGE_CAP    = _int_env("MESSAGE_CAP", 50)
-WORKER_VERSION = os.environ.get("WORKER_VERSION", "1.0.0")
+POLL_INTERVAL     = _int_env("POLL_INTERVAL", 300)
+MESSAGE_CAP       = _int_env("MESSAGE_CAP", 50)
+WORKER_VERSION    = os.environ.get("WORKER_VERSION", "1.0.0")
+WORKER_HTTP_PORT  = _int_env("WORKER_HTTP_PORT", 8080)
 
 if not API_BASE_URL:
     log.error("Missing required environment variable: API_BASE_URL")
@@ -99,6 +104,7 @@ log.info("worker started")
 log.info("config loaded")
 log.info("poll interval: %s", POLL_INTERVAL)
 log.info("message cap: %s", MESSAGE_CAP)
+log.info("trigger endpoint: POST http://0.0.0.0:%s/poll", WORKER_HTTP_PORT)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +121,59 @@ def _stop(signum, frame):
 
 signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
+
+# Set by the HTTP trigger endpoint to wake the sleep loop immediately.
+_force_poll = threading.Event()
+
+# Held during an active poll cycle. Prevents concurrent IMAP runs when
+# /poll is called while a cycle is already in progress.
+_poll_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# HTTP trigger server
+# ---------------------------------------------------------------------------
+class _TriggerHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP server exposing a single trigger endpoint."""
+
+    def do_POST(self):
+        if self.path != "/poll":
+            self._respond(404, {"error": "not found"})
+            return
+        auth = self.headers.get("Authorization", "")
+        if auth != f"Bearer {API_TOKEN}":
+            self._respond(401, {"error": "unauthorized"})
+            return
+        _force_poll.set()
+        if _poll_lock.locked():
+            log.info("Force poll requested via HTTP (queued — poll already running)")
+            self._respond(202, {"ok": True, "message": "poll queued — will run after current cycle"})
+        else:
+            log.info("Force poll requested via HTTP")
+            self._respond(202, {"ok": True, "message": "poll triggered"})
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, {"ok": True, "worker_version": WORKER_VERSION})
+        else:
+            self._respond(404, {"error": "not found"})
+
+    def _respond(self, status: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        log.debug("HTTP %s", fmt % args)
+
+
+def _start_trigger_server() -> None:
+    server = HTTPServer(("0.0.0.0", WORKER_HTTP_PORT), _TriggerHandler)
+    log.info("Trigger server listening on :%s", WORKER_HTTP_PORT)
+    server.serve_forever()
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +467,13 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
 # Main loop
 # ---------------------------------------------------------------------------
 def main() -> None:
+    threading.Thread(target=_start_trigger_server, daemon=True).start()
+
     while _running:
+        # Consume any trigger that arrived during the previous cycle before
+        # starting a new one — prevents a stale event from skipping the sleep.
+        _force_poll.clear()
+
         poll_status = "ok"
         imported = skipped = errors = 0
         last_error: Optional[str] = None
@@ -419,27 +484,32 @@ def main() -> None:
             _send_status("api_unavailable", 0, 0, 0, "health_check_failed")
         else:
             # 2–4. IMAP → search → process
-            try:
-                imported, skipped, errors, last_error = poll_once()
-                if errors:
-                    poll_status = "partial_error"
-            except imaplib.IMAP4.error as exc:
-                log.error("IMAP error: %s", exc)
-                poll_status = "imap_error"
-                last_error = str(exc)
-            except Exception as exc:
-                log.error("Poll cycle failed: %s", exc)
-                poll_status = "error"
-                last_error = str(exc)
+            # _poll_lock prevents a concurrent cycle if /poll fires mid-run.
+            with _poll_lock:
+                try:
+                    imported, skipped, errors, last_error = poll_once()
+                    if errors:
+                        poll_status = "partial_error"
+                except imaplib.IMAP4.error as exc:
+                    log.error("IMAP error: %s", exc)
+                    poll_status = "imap_error"
+                    last_error = str(exc)
+                except Exception as exc:
+                    log.error("Poll cycle failed: %s", exc)
+                    poll_status = "error"
+                    last_error = str(exc)
 
             # 5. Heartbeat
             _send_status(poll_status, imported, skipped, errors, last_error)
 
-        # 6. Sleep in 1 s chunks so SIGTERM is handled promptly
+        # 6. Sleep until interval elapses, SIGTERM arrives, or a force-poll fires.
+        # _force_poll.wait() returns immediately if the event was set during the
+        # poll cycle above, so a queued /poll is never silently dropped.
         for _ in range(POLL_INTERVAL):
             if not _running:
                 break
-            time.sleep(1)
+            if _force_poll.wait(timeout=1.0):
+                break
 
     log.info("worker stopped")
 

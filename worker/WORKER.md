@@ -1,6 +1,6 @@
 # Mail Worker — Technical Reference
 
-The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a generic HTTP REST API. It runs in a Docker container on the same private network as `proton-bridge`, polls for new messages on a configurable interval, and POSTs each parsed message to an external API.
+The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a generic HTTP REST API. It runs in a Docker container on the same private network as `proton-bridge`, polls for new messages on a configurable interval, and POSTs each parsed message to an external API. A built-in HTTP server allows external callers to trigger an immediate poll outside the normal interval.
 
 ---
 
@@ -9,21 +9,22 @@ The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a g
 | Variable | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `IMAP_HOST` | string | | `proton-bridge` | Hostname of the Bridge container |
-| `IMAP_PORT` | integer | | `2143` | socat proxy port (Bridge listens on 1143; socat re-exposes on 2143) |
+| `IMAP_PORT` | integer | | `2143` | socat proxy port (Bridge 1143, re-exposed by socat on 2143) |
 | `IMAP_USER` | string | ✓ | | Proton address used as IMAP login |
 | `IMAP_PASS` | string | ✓ | | Bridge-generated password (not the Proton account password) |
 | `IMAP_MAILBOX` | string | | `INBOX` | Mailbox to poll |
-| `IMAP_SEARCH` | string | | `UNSEEN` | Any valid IMAP SEARCH expression, e.g. `UNSEEN TO "support@example.com"` |
+| `IMAP_SEARCH` | string | | `UNSEEN` | Any valid IMAP SEARCH expression |
 | `MARK_SEEN` | bool | | `true` | Mark message `\Seen` after a successful import or duplicate response |
 | `API_BASE_URL` | string | ✓ | | Base URL of the REST API, no trailing slash |
-| `API_TOKEN` | string | ✓ | | Bearer token sent in every API request |
-| `POLL_INTERVAL` | integer | | `300` | Seconds between poll cycles |
+| `API_TOKEN` | string | ✓ | | Bearer token sent in every outbound API request and required for `/poll` |
+| `POLL_INTERVAL` | integer | | `300` | Seconds between automatic poll cycles |
 | `MESSAGE_CAP` | integer | | `50` | Maximum messages processed per cycle; `0` = unlimited |
 | `WORKER_VERSION` | string | | `1.0.0` | Version string reported in heartbeat |
+| `WORKER_HTTP_PORT` | integer | | `8080` | Port for the built-in trigger HTTP server |
 
 Credentials (`IMAP_PASS`, `API_TOKEN`) are never written to logs.
 
-Startup exits with code 1 if any required variable is missing or if `IMAP_PORT`, `POLL_INTERVAL`, or `MESSAGE_CAP` is not a valid integer.
+Startup exits with code 1 if any required variable is missing or if `IMAP_PORT`, `POLL_INTERVAL`, `MESSAGE_CAP`, or `WORKER_HTTP_PORT` is not a valid integer.
 
 ---
 
@@ -37,8 +38,10 @@ Startup exits with code 1 if any required variable is missing or if `IMAP_PORT`,
      config loaded
      poll interval: <n>
      message cap: <n>
+     trigger endpoint: POST http://0.0.0.0:8080/poll
 4. Install SIGTERM / SIGINT handlers for graceful shutdown
-5. Enter main loop
+5. Start trigger HTTP server in a background daemon thread (port 8080)
+6. Enter main loop
 ```
 
 ---
@@ -64,9 +67,17 @@ Each iteration:
      d. On failure: leave unseen, increment error counter
 8. POST {API_BASE_URL}/worker/status  (heartbeat)
 9. Logout IMAP
-10. Sleep POLL_INTERVAL seconds
-    (sleep is broken into 1-second ticks so SIGTERM is handled promptly)
+10. Sleep until:
+      - POLL_INTERVAL seconds elapse, OR
+      - SIGTERM / SIGINT received, OR
+      - POST /poll trigger fires
+    (1-second ticks via threading.Event.wait so all three wake conditions
+     are handled promptly)
 ```
+
+**Concurrent poll protection:** a `threading.Lock` is held for the duration of step 2–9. If `POST /poll` arrives while a cycle is running, the event is still set — the current cycle finishes normally, then the sleep is skipped and a second cycle starts immediately. No two IMAP sessions ever run simultaneously.
+
+**Trigger during sleep:** `_force_poll` is cleared at the *top* of each iteration (not at the start of sleep), so a trigger that fires during steps 2–9 is never silently dropped — it will wake the next sleep immediately.
 
 IMAP errors, network errors, and unhandled exceptions are caught per cycle. The worker logs the error and continues to the next cycle rather than exiting.
 
@@ -110,20 +121,18 @@ Encoded as a lowercase hex string. Null when `imap_uidvalidity` is missing.
 
 ### Header normalisation
 
-All three message-ID fields are normalised the same way:
+`Message-ID`, `In-Reply-To`, and `References` are normalised consistently:
 - Strip surrounding whitespace
 - Strip surrounding `< >`
 - Convert to lowercase
 
-```python
-# e.g.  "<ABC@proton.me>"  →  "abc@proton.me"
-```
-
-`references` is split on whitespace and each entry is normalised individually, producing a list.
+`references` is split on whitespace and each entry normalised individually, producing a list.
 
 ### Body extraction
 
-MIME parts are walked recursively. Parts with a `Content-Disposition: attachment` header are skipped (phase 1 — attachments not supported). `text/plain` parts are joined into `body_text`; `text/html` parts into `body_html`. For non-multipart messages the single payload is placed in whichever field matches its content type.
+MIME parts are walked recursively. Parts with `Content-Disposition: attachment` are skipped (attachments not supported in phase 1). `text/plain` parts are joined into `body_text`; `text/html` parts into `body_html`. Non-multipart messages go into whichever field matches their content type.
+
+Malformed messages do not crash the worker — a parse exception increments the error counter and skips to the next message.
 
 ### Parsed fields
 
@@ -145,26 +154,76 @@ MIME parts are walked recursively. Parts with a `Content-Disposition: attachment
 | `body_html` | MIME body | string | |
 | `raw_headers` | All headers | string | `Key: Value\r\n` per line |
 
-Malformed messages do not crash the worker. A parse exception increments the error counter and skips to the next message.
+---
+
+## Trigger endpoint (worker exposes)
+
+The worker runs a lightweight HTTP server on port `8080` (configurable via `WORKER_HTTP_PORT`) in a background daemon thread. It accepts connections from any container on the same Docker network. No `ports:` mapping is added in Compose — this is internal-only.
+
+Expected base URLs from a sibling container:
+```
+http://mail-worker:8080/health
+http://mail-worker:8080/poll
+```
+
+### `GET /health`
+
+No authentication required. Suitable as a Docker healthcheck.
+
+**Request:**
+```http
+GET http://mail-worker:8080/health
+```
+
+**Response `200`:**
+```json
+{ "ok": true, "worker_version": "1.0.0" }
+```
+
+### `POST /poll`
+
+Wakes the sleep loop immediately and triggers a poll cycle outside the normal interval. If a poll cycle is already running, the trigger is queued — the current cycle finishes first, then a second cycle runs immediately. Two IMAP sessions never overlap.
+
+**Request:**
+```http
+POST http://mail-worker:8080/poll
+Authorization: Bearer {API_TOKEN}
+```
+
+**Response `202` — trigger accepted:**
+```json
+{ "ok": true, "message": "poll triggered" }
+```
+
+**Response `202` — already polling, queued:**
+```json
+{ "ok": true, "message": "poll queued — will run after current cycle" }
+```
+
+**Response `401` — missing or wrong token:**
+```json
+{ "error": "unauthorized" }
+```
+
+**Example:**
+```bash
+curl -s -X POST http://mail-worker:8080/poll \
+  -H "Authorization: Bearer $API_TOKEN"
+```
 
 ---
 
-## API endpoints
+## API endpoints (worker calls outbound)
 
 ### `GET {API_BASE_URL}/health`
 
-**Purpose:** Verify the API is reachable before starting a poll cycle.
+Called at the start of every poll cycle to verify the API is reachable.
 
-**Request:** No body. `Authorization: Bearer {API_TOKEN}` header is sent.
+**Request:** No body. `Authorization: Bearer {API_TOKEN}` header sent.
 
 **Expected response — HTTP 200:**
 ```json
-{
-  "ok": true,
-  "plugin": "Biopentra Support Desk",
-  "version": "2.0.0",
-  "time": "2026-05-13T12:00:00Z"
-}
+{ "ok": true }
 ```
 
 **Worker behaviour:**
@@ -179,7 +238,7 @@ Malformed messages do not crash the worker. A parse exception increments the err
 
 ### `POST {API_BASE_URL}/messages/import`
 
-**Purpose:** Deliver one parsed message to the API.
+Delivers one parsed message per request.
 
 **Request headers:**
 ```http
@@ -201,7 +260,7 @@ Content-Type: application/json
   "from_name":        "Customer Name",
   "to_email":         "support@example.com",
   "subject":          "Question about order",
-  "date":             "2026-05-13T12:00:00+00:00",
+  "date":             "2026-05-14T08:00:00+00:00",
   "body_text":        "Plain text body",
   "body_html":        "<p>HTML body</p>",
   "raw_headers":      "From: Customer Name <customer@example.com>\r\nTo: ...\r\n"
@@ -209,7 +268,6 @@ Content-Type: application/json
 ```
 
 **Expected responses:**
-
 ```json
 { "status": "imported",          "ticket_id": 123, "message_id": "abc123@proton.me" }
 { "status": "skipped_duplicate", "reason": "message_id" }
@@ -222,18 +280,16 @@ Content-Type: application/json
 | HTTP 2xx, `status=imported` | Yes (if `MARK_SEEN=true`) | `imported++` |
 | HTTP 2xx, `status=skipped_duplicate` | Yes (if `MARK_SEEN=true`) | `skipped++` |
 | HTTP 2xx, unexpected `status` | No | `errors++` |
-| HTTP 400 / 401 | No | `errors++` (logged as non-retryable) |
-| HTTP 500 | No | `errors++` (logged as retryable) |
+| HTTP 400 / 401 | No | `errors++` (non-retryable, logged ERROR) |
+| HTTP 500 | No | `errors++` (retryable, logged WARNING) |
 | Timeout | No | `errors++` |
 | Network error | No | `errors++` |
-
-`400` and `401` are logged at ERROR level and not retried in the same cycle. `500` and timeouts are logged at WARNING level and will be retried on the next cycle (message remains unseen).
 
 ---
 
 ### `POST {API_BASE_URL}/worker/status`
 
-**Purpose:** Heartbeat. Sent once after every poll cycle, including failed ones.
+Heartbeat sent once after every poll cycle, including failed ones.
 
 **Request headers:**
 ```http
@@ -245,7 +301,7 @@ Content-Type: application/json
 ```json
 {
   "worker_version":   "1.0.0",
-  "heartbeat_at":     "2026-05-13T12:01:00+00:00",
+  "heartbeat_at":     "2026-05-14T08:01:00+00:00",
   "last_poll_status": "ok",
   "imported":         5,
   "skipped":          2,
@@ -281,11 +337,7 @@ A failed heartbeat is logged at WARNING level. The worker continues regardless.
 2. The API returned HTTP 2xx
 3. The response body contains `"status": "imported"` or `"status": "skipped_duplicate"`
 
-`\Seen` is **not** set after:
-- Parse failure
-- API 4xx / 5xx
-- Timeout or network error
-- Unexpected API status string
+`\Seen` is **not** set after a parse failure, API 4xx/5xx, timeout, network error, or unexpected status string.
 
 ---
 
@@ -293,11 +345,12 @@ A failed heartbeat is logged at WARNING level. The worker continues regardless.
 
 ```dockerfile
 FROM python:3.13-slim
-RUN useradd -r -s /bin/false worker   # non-root
+RUN useradd -r -s /bin/false worker
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY worker.py .
+EXPOSE 8080
 USER worker
 CMD ["python", "worker.py"]
 ```
@@ -309,12 +362,12 @@ CMD ["python", "worker.py"]
 | `bridge-net` | Reach `proton-bridge:2143` (IMAP) |
 | API network | Reach `API_BASE_URL` (if API runs in Docker) |
 
-If `API_BASE_URL` is a public HTTPS URL the worker only needs `bridge-net` (outbound internet is available by default).
+If `API_BASE_URL` is a public HTTPS URL, `bridge-net` alone is sufficient.
 
 **The container does not:**
-- Expose any ports
 - Store mail on disk
 - Write to any volume
+- Require root
 
 ---
 
@@ -322,7 +375,7 @@ If `API_BASE_URL` is a public HTTPS URL the worker only needs `bridge-net` (outb
 
 | Package | Purpose |
 |---|---|
-| `requests` | HTTP client for all API calls |
+| `requests` | HTTP client for all outbound API calls |
 | `python-dotenv` | Optional `.env` file loading |
 
-Standard library: `email`, `hashlib`, `imaplib`, `logging`, `os`, `re`, `signal`, `ssl`, `sys`, `time`
+Standard library: `email`, `hashlib`, `http.server`, `imaplib`, `json`, `logging`, `os`, `re`, `signal`, `ssl`, `sys`, `threading`, `time`

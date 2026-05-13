@@ -45,6 +45,8 @@ services:
     container_name: mail-worker
     env_file:
       - .env
+    environment:
+      WORKER_HTTP_PORT: "8080"     # internal only — no ports: mapping
     networks:
       - bridge-net
     depends_on:
