@@ -1,164 +1,212 @@
-# Proton Mail Bridge — Docker Setup
+# Proton Mail Bridge — Docker
 
-A self-contained Docker Compose stack that runs [Proton Mail Bridge](https://proton.me/mail/bridge) as a headless daemon and exposes IMAP and SMTP on a private Docker network. Includes a Python test client and notes on integrating with WordPress.
+> **For AI agents:** This README is written as a reference for implementing Proton Mail IMAP access in applications such as WordPress. Jump to [Connecting an application](#connecting-an-application) for connection parameters and code.
 
----
-
-## Table of contents
-
-1. [What is Proton Mail Bridge?](#1-what-is-proton-mail-bridge)
-2. [How Bridge works](#2-how-bridge-works)
-3. [This Docker setup](#3-this-docker-setup)
-4. [First-time setup](#4-first-time-setup)
-5. [Day-to-day commands](#5-day-to-day-commands)
-6. [IMAP test client](#6-imap-test-client)
-7. [WordPress integration](#7-wordpress-integration)
-8. [Security notes](#8-security-notes)
-9. [Troubleshooting](#9-troubleshooting)
+Pre-built image: **`ghcr.io/magpern/proton-bridge:latest`**
+Source: <https://github.com/magpern/proton-bridge>
+Releases: <https://github.com/magpern/proton-bridge/releases>
 
 ---
 
-## 1. What is Proton Mail Bridge?
+## What this is
 
-Proton Mail is an end-to-end encrypted email service. All messages are encrypted on Proton's servers — standard IMAP/SMTP clients cannot decrypt them directly.
+[Proton Mail](https://proton.me/mail) stores all messages end-to-end encrypted. Standard IMAP clients cannot decrypt them. **Proton Mail Bridge** is a local proxy that:
 
-**Proton Mail Bridge** is a local application that sits between your email client and Proton's servers:
+1. Holds your Proton decryption keys
+2. Speaks standard IMAP/SMTP to any client
+3. Transparently decrypts inbound and encrypts outbound messages
 
-- It holds your decryption keys locally.
-- It speaks standard IMAP and SMTP to your client.
-- It transparently encrypts outgoing messages and decrypts incoming ones before handing them to the client.
-
-The result: any standard email client (Thunderbird, Apple Mail, Outlook, Python's `imaplib`, WordPress…) can read and send Proton Mail as if it were a normal IMAP/SMTP server — without ever exposing your plaintext messages to Proton's infrastructure.
+This repo packages Bridge as a headless Docker container so any containerised application can read and send Proton Mail using ordinary IMAP/SMTP libraries — no Proton-specific SDK required.
 
 ---
 
-## 2. How Bridge works
+## Architecture
 
 ```
 Your application (IMAP client)
         │
-        │  Standard IMAP / SMTP  (localhost, plain or STARTTLS)
+        │  Standard IMAP — STARTTLS  (proton-bridge:2143 on bridge-net)
         ▼
-┌─────────────────────┐
-│  Proton Mail Bridge │  ← runs on your machine / in Docker
-│  ─────────────────  │
-│  Decrypts inbound   │
-│  Encrypts outbound  │
-│  Manages sessions   │
-└─────────────────────┘
+┌──────────────────────────────────────┐
+│  proton-bridge container             │
+│                                      │
+│  socat  0.0.0.0:2143 → 127.0.0.1:1143│  ← Docker-reachable proxy
+│  Bridge         127.0.0.1:1143       │  ← actual IMAP server
+│  socat  0.0.0.0:2025 → 127.0.0.1:1025│  ← SMTP proxy
+│  Bridge         127.0.0.1:1025       │  ← actual SMTP server
+└──────────────────────────────────────┘
         │
-        │  Proton API (HTTPS, end-to-end encrypted)
+        │  Proton API (HTTPS, E2E encrypted)
         ▼
    Proton Mail servers
 ```
 
-### Ports (Bridge defaults)
-
-| Protocol | Port | Security |
-|---|---|---|
-| IMAP | 1143 | STARTTLS |
-| SMTP | 1025 | STARTTLS |
-
-Bridge binds these ports to `127.0.0.1` only. In this Docker setup a `socat` proxy re-exposes them inside the container network (see §3).
-
-### Credentials
-
-Bridge generates a **separate, random password** for each account. This password is used for IMAP/SMTP login — your real Proton account password is never sent to any IMAP/SMTP client. You can revoke the Bridge password at any time without changing your Proton account.
-
-### Session persistence
-
-Bridge stores its session token and account keys using the `pass` password manager (GPG-encrypted on Linux). This is why the Docker volumes must persist: losing the volumes means Bridge loses the session and you must log in again.
+Bridge binds only to `127.0.0.1` inside the container. `socat` re-exposes IMAP and SMTP on `0.0.0.0` (on different port numbers to avoid conflicts) so other containers on the same Docker network can reach them.
 
 ---
 
-## 3. This Docker setup
+## IMAP connection parameters
 
-### Architecture
+These are the values an application needs to connect once Bridge is running and logged in.
 
-```
-┌────────────────────── Docker: bridge-net ──────────────────────┐
-│                                                                  │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │  proton-bridge container                                 │  │
-│   │                                                          │  │
-│   │   protonmail-bridge --noninteractive                     │  │
-│   │      └─ IMAP  127.0.0.1:1143  (loopback only)           │  │
-│   │      └─ SMTP  127.0.0.1:1025  (loopback only)           │  │
-│   │                                                          │  │
-│   │   socat proxy (exposes to Docker network)                │  │
-│   │      └─ 0.0.0.0:2143  →  127.0.0.1:1143  (IMAP)        │  │
-│   │      └─ 0.0.0.0:2025  →  127.0.0.1:1025  (SMTP)        │  │
-│   └──────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│   ┌──────────────────────┐   ┌──────────────────────────────┐   │
-│   │  imap-client         │   │  your-wordpress (optional)   │   │
-│   │  python imap_test.py │   │  connects to proton-bridge   │   │
-│   │  (profile: test)     │   │  on bridge-net               │   │
-│   └──────────────────────┘   └──────────────────────────────┘   │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-
-Windows host — NO host port bindings; IMAP/SMTP not reachable from host
-```
-
-### File layout
-
-```
-proton/
-├── docker-compose.yml        Main stack
-├── .env.example              Copy → .env
-├── .env                      Your credentials (gitignored)
-├── imap_test.py              Python IMAP client
-├── requirements.txt
-├── bridge/
-│   ├── Dockerfile            Debian + Bridge .deb + socat
-│   └── entrypoint.sh         GPG/pass init + socat proxy + daemon
-└── client/
-    └── Dockerfile            Python 3.13-slim image
-```
-
-### Volumes
-
-| Volume | Mounted at | Contents |
-|---|---|---|
-| `bridge_config` | `/root/.config/protonmail` | Bridge session, account keys |
-| `bridge_gnupg` | `/root/.gnupg` | GPG key ring used by `pass` |
-| `bridge_pass` | `/root/.password-store` | `pass` credential store |
-
-**Deleting any of these volumes forces a fresh login.**
+| Parameter | Value |
+|---|---|
+| Host | `proton-bridge` (Docker service name on `bridge-net`) |
+| IMAP port | `2143` (socat proxy → Bridge 1143) |
+| SMTP port | `2025` (socat proxy → Bridge 1025) |
+| Security | STARTTLS |
+| Certificate | Self-signed for `127.0.0.1` — skip hostname verification |
+| Username | Your Proton address, e.g. `user@proton.me` |
+| Password | **Bridge-generated** (≠ your Proton account password) — see [First-time login](#first-time-login) |
 
 ---
 
-## 4. First-time setup
+## Connecting an application
 
-### Prerequisites
+### Add Bridge to an existing docker-compose stack
 
-- Docker Desktop for Windows (WSL 2 backend recommended)
-- Python 3.8+ (only needed if running `imap_test.py` locally; not needed for the Docker-only path)
+```yaml
+services:
+  proton-bridge:
+    image: ghcr.io/magpern/proton-bridge:latest
+    container_name: proton-bridge
+    restart: unless-stopped
+    volumes:
+      - bridge_config:/root/.config/protonmail
+      - bridge_gnupg:/root/.gnupg
+      - bridge_pass:/root/.password-store
+    networks:
+      - bridge-net
+    stdin_open: true
+    tty: true
 
-### Step 1 — Clone and configure
+  your-app:
+    image: your-app-image
+    networks:
+      - bridge-net          # same network — can reach proton-bridge:2143
+    environment:
+      IMAP_HOST: proton-bridge
+      IMAP_PORT: "2143"
 
-```powershell
-cd d:\DeveloperArea\Repos\proton
-Copy-Item .env.example .env
-notepad .env   # set BRIDGE_VERSION if needed
+networks:
+  bridge-net:
+    driver: bridge
+
+volumes:
+  bridge_config:
+  bridge_gnupg:
+  bridge_pass:
 ```
 
-Check the latest Bridge version at:
-<https://github.com/ProtonMail/proton-bridge/releases>
+### Python (imaplib)
 
-### Step 2 — Build
+```python
+import imaplib, ssl
 
-```powershell
-docker compose build
+ctx = ssl.create_default_context()
+ctx.check_hostname = False        # Bridge cert is for 127.0.0.1, not the service name
+ctx.verify_mode = ssl.CERT_NONE
+
+conn = imaplib.IMAP4("proton-bridge", 2143)
+conn.starttls(ssl_context=ctx)
+conn.login("user@proton.me", "<bridge-password>")
+
+conn.select("INBOX")
+_, data = conn.search(None, "ALL")
+print(data[0].split())   # list of message IDs
+
+conn.logout()
 ```
 
-### Step 3 — First-time login
+### PHP (imap extension)
 
-Bridge's `--cli` mode cannot attach to a running daemon (they share a lock file). Stop the daemon, run CLI in a temporary container that shares the same volumes, log in, then restart.
+```php
+$imap = imap_open(
+    "{proton-bridge:2143/imap/tls/novalidate-cert}INBOX",
+    "user@proton.me",
+    "<bridge-password>"
+);
 
-```powershell
-# Nothing running yet on first setup, so just:
+$unseen = imap_search($imap, "UNSEEN");
+foreach ($unseen ?? [] as $uid) {
+    $header  = imap_headerinfo($imap, $uid);
+    $from    = $header->from[0]->mailbox . "@" . $header->from[0]->host;
+    $subject = imap_utf8($header->subject ?? "");
+    // process …
+    imap_setflag_full($imap, (string)$uid, "\\Seen");
+}
+imap_close($imap);
+```
+
+### WordPress — WP-Cron plugin
+
+Add to `wp-config.php`:
+
+```php
+define("PROTON_IMAP_HOST", "proton-bridge");
+define("PROTON_IMAP_PORT", 2143);
+define("PROTON_IMAP_USER", "user@proton.me");
+define("PROTON_IMAP_PASS", "<bridge-password>");
+```
+
+Plugin skeleton (`wp-content/plugins/proton-reader/proton-reader.php`):
+
+```php
+<?php
+/** Plugin Name: Proton Mail Reader */
+defined("ABSPATH") || exit;
+
+register_activation_hook(__FILE__, function () {
+    if (!wp_next_scheduled("proton_fetch")) {
+        wp_schedule_event(time(), "hourly", "proton_fetch");
+    }
+});
+register_deactivation_hook(__FILE__, function () {
+    wp_clear_scheduled_hook("proton_fetch");
+});
+
+add_action("proton_fetch", function () {
+    $host = PROTON_IMAP_HOST;
+    $port = PROTON_IMAP_PORT;
+    $mbox = imap_open(
+        "{{$host}:{$port}/imap/tls/novalidate-cert}INBOX",
+        PROTON_IMAP_USER,
+        PROTON_IMAP_PASS
+    );
+    if (!$mbox) {
+        error_log("[proton] " . imap_last_error());
+        return;
+    }
+    $ids = imap_search($mbox, "UNSEEN") ?: [];
+    foreach ($ids as $id) {
+        $h = imap_headerinfo($mbox, $id);
+        // do_action("proton_new_email", $h->from[0], imap_utf8($h->subject));
+        imap_setflag_full($mbox, (string)$id, "\\Seen");
+    }
+    imap_close($mbox);
+});
+```
+
+WordPress must be on `bridge-net` and have the PHP `imap` extension enabled. Test manually:
+
+```bash
+docker exec wordpress wp --allow-root cron event run proton_fetch
+```
+
+---
+
+## First-time login
+
+> **This step requires a human.** Bridge must be authenticated with a Proton account before any IMAP connection will succeed. It cannot be automated — Proton requires interactive login with a password and optional 2FA.
+
+```bash
+# 1. Pull and start the stack (Bridge will be running but not logged in)
+docker compose up -d
+
+# 2. Stop just the bridge daemon
+docker compose stop proton-bridge
+
+# 3. Open an interactive CLI session (uses the same persistent volumes)
 docker compose run --rm -it proton-bridge --cli
 ```
 
@@ -166,376 +214,87 @@ Inside the Bridge CLI:
 
 ```
 > login
-Username: your.address@proton.me
+Username: user@proton.me
 Password: <your Proton account password>
 2FA code: <TOTP if enabled>
-
-Login successful.
 
 > info
 ```
 
-The `info` command shows the Bridge-generated IMAP credentials:
+`info` prints the Bridge-generated IMAP credentials:
 
 ```
-Configuration for your.address@proton.me
+Configuration for user@proton.me
 IMAP Settings
   Address:   127.0.0.1
   IMAP port: 1143
-  Username:  your.address@proton.me
-  Password:  AbCdEfGh1234_XyZ   ← copy this
+  Username:  user@proton.me
+  Password:  AbCdEfGh1234_XyZ   ← this goes into your app config
   Security:  STARTTLS
-```
 
-```
 > quit
 ```
 
-### Step 4 — Fill in credentials
-
-Edit `.env`:
-
-```env
-BRIDGE_IMAP_USER=your.address@proton.me
-BRIDGE_IMAP_PASS=AbCdEfGh1234_XyZ
-BRIDGE_FILTER_TO=                    # optional: filter by recipient address
-BRIDGE_FETCH_LIMIT=0                 # 0 = all messages
-```
-
-### Step 5 — Start the daemon
-
-```powershell
+```bash
+# 4. Restart the daemon
 docker compose up -d
-docker logs -f proton-bridge
 ```
 
-You should see:
-
-```
-[bridge] socat proxies active (IMAP :2143→:1143  SMTP :2025→:1025).
-```
-
-### Step 6 — Test
-
-```powershell
-docker compose run --rm imap-client
-```
+The Bridge password is permanent until explicitly revoked. It survives container restarts as long as the three Docker volumes (`bridge_config`, `bridge_gnupg`, `bridge_pass`) are intact. **Deleting any of these volumes forces a fresh login.**
 
 ---
 
-## 5. Day-to-day commands
+## Operations reference
 
 | Task | Command |
 |---|---|
 | Start daemon | `docker compose up -d` |
 | Stop daemon | `docker compose down` |
 | View logs | `docker logs -f proton-bridge` |
-| Open Bridge CLI | `docker compose stop proton-bridge && docker compose run --rm -it proton-bridge --cli` |
-| Show IMAP credentials | CLI → `info` |
-| Show status | CLI → `status` |
-| Log out an account | CLI → `logout your.address@proton.me` |
-| Restart daemon after CLI | `docker compose up -d` |
-| Rebuild after version bump | `docker compose up -d --build` |
-| Wipe everything and start fresh | `docker compose down -v` |
+| Re-open CLI (stop daemon first) | `docker compose stop proton-bridge && docker compose run --rm -it proton-bridge --cli` |
+| Show credentials | CLI → `info` |
+| Show sync status | CLI → `status` |
+| Log out | CLI → `logout user@proton.me` |
+| Wipe all data | `docker compose down -v` |
 
 ---
 
-## 6. IMAP test client
+## Releases and versioning
 
-`imap_test.py` connects to the Bridge container, searches INBOX, and prints messages sorted newest-first.
+Tags follow the format `v<bridge-version>-<wrapper-patch>`:
 
-### Environment variables
+```
+v3.24.2-1   first wrapper release for Proton Bridge 3.24.2
+v3.24.2-2   bug fix in entrypoint, same Bridge version
+v3.25.0-1   first wrapper release for Proton Bridge 3.25.0
+```
 
-| Variable | Default | Description |
+The GitHub Actions workflow builds and pushes to GHCR **only on tagged commits**. Branch pushes compile the image for validation but do not publish.
+
+To release a new version:
+
+```bash
+git tag v3.25.0-1
+git push origin v3.25.0-1
+```
+
+This publishes:
+
+```
+ghcr.io/magpern/proton-bridge:3.25.0
+ghcr.io/magpern/proton-bridge:3.25
+ghcr.io/magpern/proton-bridge:latest
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| `BRIDGE_IMAP_HOST` | `proton-bridge` | Container name on `bridge-net` |
-| `BRIDGE_IMAP_PORT` | `2143` | socat proxy port |
-| `BRIDGE_IMAP_USER` | — | Bridge username (from `info`) |
-| `BRIDGE_IMAP_PASS` | — | Bridge password (from `info`) |
-| `BRIDGE_IMAP_SSL` | `false` | `true` for SSL, `false` for STARTTLS |
-| `BRIDGE_SKIP_TLS_VERIFY` | `true` | Accept Bridge's self-signed certificate |
-| `BRIDGE_FILTER_TO` | *(empty)* | Filter by To/Cc recipient (substring) |
-| `BRIDGE_FETCH_LIMIT` | `0` | Max messages to show; `0` = all |
-
-### Examples
-
-```powershell
-# All messages in INBOX
-docker compose run --rm imap-client
-
-# Only messages to a specific address
-docker compose run --rm -e BRIDGE_FILTER_TO=info@example.com imap-client
-
-# Latest 20 messages to a specific address
-docker compose run --rm \
-  -e BRIDGE_FILTER_TO=info@example.com \
-  -e BRIDGE_FETCH_LIMIT=20 \
-  imap-client
-```
-
----
-
-## 7. WordPress integration
-
-WordPress can read email from Proton Mail Bridge the same way any IMAP client does. The key requirement: **WordPress must run on the same Docker network (`bridge-net`) as `proton-bridge`.**
-
-### Add WordPress to the stack
-
-```yaml
-# append to docker-compose.yml
-
-  wordpress:
-    image: wordpress:latest
-    container_name: wordpress
-    restart: unless-stopped
-    networks:
-      - bridge-net          # gives access to proton-bridge:2143
-    environment:
-      WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_USER: wp
-      WORDPRESS_DB_PASSWORD: wp
-      WORDPRESS_DB_NAME: wordpress
-    ports:
-      - "127.0.0.1:8080:80"
-    depends_on:
-      - db
-      - proton-bridge
-
-  db:
-    image: mysql:8
-    container_name: wordpress-db
-    restart: unless-stopped
-    networks:
-      - bridge-net
-    environment:
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wp
-      MYSQL_PASSWORD: wp
-      MYSQL_ROOT_PASSWORD: rootpassword
-    volumes:
-      - db_data:/var/lib/mysql
-
-volumes:
-  db_data:
-```
-
-From inside the WordPress container, the Bridge is reachable at:
-
-| Setting | Value |
-|---|---|
-| IMAP host | `proton-bridge` |
-| IMAP port | `2143` |
-| Username | Bridge username (from `info`) |
-| Password | Bridge password (from `info`) |
-| Security | STARTTLS |
-
-### Option A — Plugin (no code)
-
-Several WordPress plugins can connect to an IMAP mailbox and process incoming messages. Install via the WordPress admin panel.
-
-**For support tickets / help desk:**
-- [Awesome Support](https://wordpress.org/plugins/awesome-support/) — creates tickets from emails, configure IMAP under *Awesome Support → Settings → Emails → Fetch Emails*
-- [WP Desk Ticketing System](https://wordpress.org/plugins/wp-desk-ticketing-system/)
-
-**For general email-to-post / email processing:**
-- [Postie](https://wordpress.org/plugins/postie/) — publishes posts from emails received in an IMAP mailbox
-- [Email to Post](https://wordpress.org/plugins/email-to-post/) — similar
-
-Configure any of these with:
-- **IMAP server:** `proton-bridge`
-- **Port:** `2143`
-- **Username/Password:** Bridge credentials
-- **TLS:** STARTTLS (disable certificate verification if the plugin supports it, as Bridge uses a self-signed cert)
-
-### Option B — Custom PHP (WP-Cron + IMAP)
-
-For custom processing (e.g. parsing contact form replies, importing orders from email) use PHP's built-in `imap_*` functions inside a scheduled WP-Cron job.
-
-PHP's IMAP extension must be enabled. In the WordPress container add a custom image or use a Dockerfile:
-
-```dockerfile
-FROM wordpress:latest
-RUN docker-php-ext-install imap || true
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libc-client-dev libkrb5-dev \
-    && docker-php-ext-configure imap --with-kerberos --with-imap-ssl \
-    && docker-php-ext-install imap \
-    && rm -rf /var/lib/apt/lists/*
-```
-
-#### Example plugin: fetch and log unread emails
-
-Create `wp-content/plugins/proton-imap-reader/proton-imap-reader.php`:
-
-```php
-<?php
-/**
- * Plugin Name: Proton IMAP Reader
- * Description: Reads unread emails from Proton Mail Bridge via IMAP.
- */
-
-defined('ABSPATH') || exit;
-
-// Register a daily WP-Cron event.
-register_activation_hook(__FILE__, function () {
-    if (!wp_next_scheduled('proton_imap_fetch')) {
-        wp_schedule_event(time(), 'hourly', 'proton_imap_fetch');
-    }
-});
-
-register_deactivation_hook(__FILE__, function () {
-    wp_clear_scheduled_hook('proton_imap_fetch');
-});
-
-add_action('proton_imap_fetch', 'proton_imap_fetch_emails');
-
-function proton_imap_fetch_emails(): void {
-    // Credentials — store in wp-config.php or use a secrets manager.
-    $host = defined('PROTON_IMAP_HOST') ? PROTON_IMAP_HOST : 'proton-bridge';
-    $port = defined('PROTON_IMAP_PORT') ? PROTON_IMAP_PORT : 2143;
-    $user = defined('PROTON_IMAP_USER') ? PROTON_IMAP_USER : '';
-    $pass = defined('PROTON_IMAP_PASS') ? PROTON_IMAP_PASS : '';
-
-    if (!$user || !$pass) {
-        error_log('[proton-imap] PROTON_IMAP_USER / PROTON_IMAP_PASS not set.');
-        return;
-    }
-
-    // /novalidate-cert: accept Bridge's self-signed certificate.
-    // /tls:            use STARTTLS.
-    $mailbox_str = "{{$host}:{$port}/imap/tls/novalidate-cert}INBOX";
-
-    $imap = @imap_open($mailbox_str, $user, $pass, 0, 1);
-    if (!$imap) {
-        error_log('[proton-imap] Connection failed: ' . imap_last_error());
-        return;
-    }
-
-    // Fetch unseen messages.
-    $uids = imap_search($imap, 'UNSEEN');
-    if (!$uids) {
-        imap_close($imap);
-        return;
-    }
-
-    foreach ($uids as $uid) {
-        $header  = imap_headerinfo($imap, $uid);
-        $from    = $header->from[0]->mailbox . '@' . $header->from[0]->host;
-        $subject = isset($header->subject)
-            ? imap_utf8($header->subject)
-            : '(no subject)';
-        $date    = $header->date;
-
-        // ── Do something with the email here ──────────────────────────────
-        // Examples:
-        //   - wp_insert_post([...]) to create a post
-        //   - do_action('proton_imap_new_email', $from, $subject, $body)
-        //   - update_option() to store the latest message
-        // ─────────────────────────────────────────────────────────────────
-
-        error_log("[proton-imap] New email — From: {$from} | Subject: {$subject} | Date: {$date}");
-
-        // Mark as seen so we don't process it again.
-        imap_setflag_full($imap, (string)$uid, '\\Seen');
-    }
-
-    imap_close($imap);
-}
-```
-
-Add credentials to `wp-config.php` (never hardcode them in the plugin):
-
-```php
-define('PROTON_IMAP_HOST', 'proton-bridge');
-define('PROTON_IMAP_PORT', 2143);
-define('PROTON_IMAP_USER', 'your.address@proton.me');
-define('PROTON_IMAP_PASS', 'AbCdEfGh1234_XyZ');
-```
-
-#### Trigger the cron manually for testing
-
-```bash
-docker exec wordpress wp --allow-root cron event run proton_imap_fetch
-```
-
-### Option C — Sidecar PHP script (outside WordPress)
-
-For heavy processing (import pipelines, CRM sync) it is cleaner to run a standalone PHP or Python script as its own container in `bridge-net` and write results to the WordPress database or REST API directly, rather than burdening WP-Cron.
-
-```yaml
-  email-processor:
-    build: ./processor        # your custom image
-    networks:
-      - bridge-net
-    environment:
-      PROTON_IMAP_HOST: proton-bridge
-      PROTON_IMAP_PORT: 2143
-    env_file:
-      - .env
-    restart: unless-stopped
-```
-
----
-
-## 8. Security notes
-
-| Concern | How it is handled here |
-|---|---|
-| IMAP/SMTP exposed to the internet | Not exposed. No host port bindings. |
-| IMAP/SMTP exposed to the Windows host | Not exposed. Ports only exist on `bridge-net`. |
-| Bridge credentials in plain text | Stored in `.env` (gitignored). Use Docker secrets for production. |
-| Bridge GPG key has no passphrase | Acceptable for local dev. The key is inside a Docker volume, not on the host filesystem directly. |
-| Bridge self-signed TLS cert | `BRIDGE_SKIP_TLS_VERIFY=true` is safe on a loopback/private Docker network. Do not use on a public or shared network. |
-| Volume loss = forced re-login | Back up `bridge_config`, `bridge_gnupg`, `bridge_pass` volumes if continuity matters. |
-
----
-
-## 9. Troubleshooting
-
-### `Failed to create lock file; another instance is running`
-
-You tried to run `--cli` while the daemon is running. Stop the daemon first:
-
-```powershell
-docker compose stop proton-bridge
-docker compose run --rm -it proton-bridge --cli
-# ... do what you need ...
-docker compose up -d
-```
-
-### `socket error: EOF` or `SSLEOFError`
-
-Bridge binds to `127.0.0.1` inside the container; Docker's port mapping cannot reach it. The `socat` proxy in `entrypoint.sh` bridges the gap. If socat hasn't started yet (Bridge still initialising), wait a few seconds and retry.
-
-### `no such user` on IMAP login
-
-The credentials in `.env` don't match what Bridge generated. Re-check with:
-
-```powershell
-docker compose stop proton-bridge
-docker compose run --rm -it proton-bridge --cli
-> info
-docker compose up -d
-```
-
-Copy the `Password` field exactly into `BRIDGE_IMAP_PASS`.
-
-### `module 'email' has no attribute 'message'`
-
-Python did not auto-import the `email.message` submodule. Ensure `import email.message` is in `imap_test.py`.
-
-### GPG key generation is slow
-
-GPG needs entropy. On modern kernels this resolves in under 10 seconds. If it hangs, ensure the host is not heavily loaded.
-
-### Bridge exits immediately after start
-
-Check logs: `docker logs proton-bridge`. A stale lock file from an unclean shutdown is the most common cause. The entrypoint cleans `~/.cache/protonmail/*.lock` automatically; if it persists, wipe the `bridge_config` volume and log in again.
-
-### WordPress PHP IMAP extension missing
-
-```bash
-docker exec wordpress php -m | grep imap
-```
-
-If not listed, you need a custom WordPress image with `imap` compiled in (see §7 Option B).
+| `Failed to create lock file` | `--cli` launched while daemon is running | Stop daemon first: `docker compose stop proton-bridge` |
+| `no such user` on IMAP login | Wrong Bridge password in app config | Re-run `info` in CLI and copy the password exactly |
+| `socket error: EOF` | Bridge not yet listening (still starting) | Wait ~10 s and retry; check `docker logs proton-bridge` |
+| `Broken pipe` in socat logs | Normal — IMAP session closed cleanly | Not an error; suppressed in recent versions |
+| PHP `imap_open` returns false | `imap` extension not installed in container | Rebuild PHP image with `docker-php-ext-install imap` |
+| Volumes deleted accidentally | All Bridge state lost | Must log in again via CLI |
