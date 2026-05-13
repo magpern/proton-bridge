@@ -5,6 +5,9 @@ on:
     branches: [main]
     tags: ["v*"]
     paths:
+      # Only these files affect the built image — everything else
+      # (README.md, imap_test.py, client/**, etc.) is intentionally
+      # excluded so documentation edits don't trigger a build.
       - "bridge/**"
       - ".env.example"
       - ".github/workflows/bridge.yml"
