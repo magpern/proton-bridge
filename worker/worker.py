@@ -164,10 +164,6 @@ class _TriggerHandler(BaseHTTPRequestHandler):
         if self.path != "/poll":
             self._respond(404, {"error": "not found"})
             return
-        auth = self.headers.get("Authorization", "")
-        if auth != f"Bearer {API_TOKEN}":
-            self._respond(401, {"error": "unauthorized"})
-            return
         _force_poll.set()
         if _poll_lock.locked():
             log.info("Force poll requested via HTTP (queued — poll already running)")

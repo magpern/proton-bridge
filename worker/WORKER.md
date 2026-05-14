@@ -200,10 +200,11 @@ GET http://mail-worker:8080/health
 
 Wakes the sleep loop immediately and triggers a poll cycle outside the normal interval. If a poll cycle is already running, the trigger is queued — the current cycle finishes first, then a second cycle runs immediately. Two IMAP sessions never overlap.
 
+No authentication required. The endpoint is reachable only from containers on `bridge-net` — it is never published to the host or the internet.
+
 **Request:**
 ```http
 POST http://mail-worker:8080/poll
-Authorization: Bearer {API_TOKEN}
 ```
 
 **Response `202` — trigger accepted:**
@@ -216,15 +217,9 @@ Authorization: Bearer {API_TOKEN}
 { "ok": true, "message": "poll queued — will run after current cycle" }
 ```
 
-**Response `401` — missing or wrong token:**
-```json
-{ "error": "unauthorized" }
-```
-
 **Example:**
 ```bash
-curl -s -X POST http://mail-worker:8080/poll \
-  -H "Authorization: Bearer $API_TOKEN"
+curl -s -X POST http://mail-worker:8080/poll
 ```
 
 ---
