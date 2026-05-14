@@ -96,6 +96,7 @@ POLL_INTERVAL      = _int_env("POLL_INTERVAL", 300)
 MESSAGE_CAP        = _int_env("MESSAGE_CAP", 50)
 WORKER_VERSION     = os.environ.get("WORKER_VERSION", "1.0.0")
 WORKER_HTTP_PORT   = _int_env("WORKER_HTTP_PORT", 8080)
+IMAP_MOVE_TO       = os.environ.get("IMAP_MOVE_TO", "").strip()
 
 _VALID_MODES = ("keyword", "flagged", "seen", "none")
 if IMAP_FETCH_MODE not in _VALID_MODES:
@@ -126,6 +127,8 @@ if not API_BASE_URL:
 log.info("worker started")
 log.info("config loaded")
 log.info("fetch mode: %s  search: %s  flag: %s", IMAP_FETCH_MODE, IMAP_SEARCH, IMAP_FLAG or "none")
+if IMAP_MOVE_TO:
+    log.info("move-to: %s (flag marking disabled)", IMAP_MOVE_TO)
 log.info("poll interval: %s", POLL_INTERVAL)
 log.info("message cap: %s", MESSAGE_CAP)
 log.info("trigger endpoint: POST http://0.0.0.0:%s/poll", WORKER_HTTP_PORT)
@@ -422,6 +425,7 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
     """
     imported = skipped = errors = 0
     last_error: Optional[str] = None
+    uids_to_expunge: List[int] = []
 
     conn = _connect()
     try:
@@ -468,7 +472,19 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
                     imported += 1
                 else:
                     skipped += 1
-                if IMAP_FLAG:
+
+                if IMAP_MOVE_TO:
+                    try:
+                        typ, _ = conn.uid("COPY", str(uid_int).encode(), IMAP_MOVE_TO)
+                        if typ == "OK":
+                            conn.uid("STORE", str(uid_int).encode(), "+FLAGS", r"(\Deleted)")
+                            uids_to_expunge.append(uid_int)
+                            log.info("moved UID %s → %s", uid_int, IMAP_MOVE_TO)
+                        else:
+                            log.warning("COPY UID %s to %s failed — will retry next cycle", uid_int, IMAP_MOVE_TO)
+                    except Exception as exc:
+                        log.warning("Move failed for UID %s: %s — will retry next cycle", uid_int, exc)
+                elif IMAP_FLAG:
                     try:
                         typ, _ = conn.uid("STORE", str(uid_int).encode(), "+FLAGS", IMAP_FLAG)
                         if typ == "OK":
@@ -480,6 +496,13 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
             else:
                 errors += 1
                 last_error = f"import_error uid={uid_int}"
+
+        if uids_to_expunge:
+            try:
+                conn.expunge()
+                log.info("expunged %d messages from %s", len(uids_to_expunge), IMAP_MAILBOX)
+            except Exception as exc:
+                log.warning("Expunge failed: %s", exc)
 
     finally:
         try:

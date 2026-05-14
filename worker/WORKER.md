@@ -22,6 +22,7 @@ The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a g
 | `MESSAGE_CAP` | integer | | `50` | Maximum messages processed per cycle; `0` = unlimited |
 | `WORKER_VERSION` | string | | `1.0.0` | Version string reported in heartbeat |
 | `WORKER_HTTP_PORT` | integer | | `8080` | Port for the built-in trigger HTTP server |
+| `IMAP_MOVE_TO` | string | | *(disabled)* | Destination folder to move messages into after import; disables flag marking |
 
 Credentials (`IMAP_PASS`, `API_TOKEN`) are never written to logs.
 
@@ -340,9 +341,34 @@ A failed heartbeat is logged at WARNING level. The worker continues regardless.
 
 ---
 
-## Mark rules
+## Post-import action
 
-The configured flag (`IMAP_FETCH_MODE`) is applied via `UID STORE +FLAGS` only when **all** of the following are true:
+After a successful import (`imported` or `skipped_duplicate`), the worker performs one of two actions depending on configuration:
+
+### Move mode (`IMAP_MOVE_TO` is set)
+
+The message is moved out of the source mailbox:
+
+1. `UID COPY <uid> <IMAP_MOVE_TO>` — copy to destination folder
+2. `UID STORE <uid> +FLAGS (\Deleted)` — mark original as deleted
+3. `EXPUNGE` — remove all deleted messages (called once per cycle after all messages are processed)
+
+The destination folder must exist before the worker runs — IMAP `COPY` to a non-existent folder will fail. Create it in Proton webmail first.
+
+If `COPY` fails, a WARNING is logged and the message is left in place. The API's `imap_dedupe_key` / `skipped_duplicate` response prevents double-import on the next cycle.
+
+When `IMAP_MOVE_TO` is active, `IMAP_FETCH_MODE` flag marking is disabled. The `IMAP_SEARCH` expression should not include an `UNFLAGGED` / `UNKEYWORD` prefix since moved messages will not appear in the next search anyway.
+
+**Example configuration:**
+```env
+IMAP_MOVE_TO=Imported
+IMAP_FETCH_MODE=none
+IMAP_SEARCH=OR TO "support@example.com" TO "info@example.com"
+```
+
+### Flag mode (`IMAP_MOVE_TO` is not set)
+
+The configured flag (`IMAP_FETCH_MODE`) is applied via `UID STORE +FLAGS` when **all** of the following are true:
 
 1. `IMAP_FETCH_MODE` is not `none`
 2. The API returned HTTP 2xx
@@ -350,7 +376,7 @@ The configured flag (`IMAP_FETCH_MODE`) is applied via `UID STORE +FLAGS` only w
 
 The flag is **not** set after a parse failure, API 4xx/5xx, timeout, network error, or unexpected status string — leaving the message eligible for retry on the next cycle.
 
-If the `STORE` command itself fails (e.g. Proton Bridge rejects a custom keyword), the error is logged at WARNING level and the cycle continues. Switch `IMAP_FETCH_MODE` to `flagged` if custom keywords are unsupported.
+If the `STORE` command returns a non-OK response (e.g. Proton Bridge does not support custom keywords), the failure is logged at WARNING level and the cycle continues. Switch `IMAP_FETCH_MODE` to `flagged` if custom keywords are unsupported — `\Flagged` (the starred marker) is always supported by Bridge and is not set when reading mail on a mobile device.
 
 ---
 
