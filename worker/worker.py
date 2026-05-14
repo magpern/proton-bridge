@@ -470,7 +470,11 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
                     skipped += 1
                 if IMAP_FLAG:
                     try:
-                        conn.uid("STORE", str(uid_int).encode(), "+FLAGS", IMAP_FLAG)
+                        typ, _ = conn.uid("STORE", str(uid_int).encode(), "+FLAGS", IMAP_FLAG)
+                        if typ == "OK":
+                            log.info("flag set %s on UID %s", IMAP_FLAG, uid_int)
+                        else:
+                            log.warning("Could not set flag %s on UID %s: server returned %s", IMAP_FLAG, uid_int, typ)
                     except Exception as exc:
                         log.warning("Could not set flag %s on UID %s: %s", IMAP_FLAG, uid_int, exc)
             else:
