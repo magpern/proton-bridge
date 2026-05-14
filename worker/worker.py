@@ -11,8 +11,9 @@ Configuration (environment variables or .env file):
     IMAP_USER           Bridge login — your Proton address
     IMAP_PASS           Bridge-generated password
     IMAP_MAILBOX        Mailbox to poll             (default: INBOX)
-    IMAP_SEARCH         IMAP search criteria        (default: UNSEEN)
-    MARK_SEEN           Mark imported messages Seen (default: true)
+    IMAP_FETCH_MODE     keyword|flagged|seen|none   (default: keyword)
+    IMAP_FETCH_KEYWORD  Custom keyword name         (default: FETCHED, mode=keyword only)
+    IMAP_SEARCH         Override auto-derived search (optional)
     API_BASE_URL        REST API base, no trailing slash
     API_TOKEN           Bearer token
     POLL_INTERVAL       Seconds between cycles      (default: 300)
@@ -82,19 +83,41 @@ def _int_env(name: str, default: int) -> int:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-IMAP_HOST      = os.environ.get("IMAP_HOST", "proton-bridge")
-IMAP_PORT      = _int_env("IMAP_PORT", 2143)
-IMAP_USER      = _require("IMAP_USER")
-IMAP_PASS      = _require("IMAP_PASS")
-IMAP_MAILBOX   = os.environ.get("IMAP_MAILBOX", "INBOX")
-IMAP_SEARCH    = os.environ.get("IMAP_SEARCH", "UNSEEN")
-MARK_SEEN      = os.environ.get("MARK_SEEN", "true").lower() in ("1", "true", "yes")
-API_BASE_URL   = os.environ.get("API_BASE_URL", "").rstrip("/")
-API_TOKEN      = _require("API_TOKEN")
-POLL_INTERVAL     = _int_env("POLL_INTERVAL", 300)
-MESSAGE_CAP       = _int_env("MESSAGE_CAP", 50)
-WORKER_VERSION    = os.environ.get("WORKER_VERSION", "1.0.0")
-WORKER_HTTP_PORT  = _int_env("WORKER_HTTP_PORT", 8080)
+IMAP_HOST          = os.environ.get("IMAP_HOST", "proton-bridge")
+IMAP_PORT          = _int_env("IMAP_PORT", 2143)
+IMAP_USER          = _require("IMAP_USER")
+IMAP_PASS          = _require("IMAP_PASS")
+IMAP_MAILBOX       = os.environ.get("IMAP_MAILBOX", "INBOX")
+IMAP_FETCH_MODE    = os.environ.get("IMAP_FETCH_MODE", "keyword").lower()
+IMAP_FETCH_KEYWORD = os.environ.get("IMAP_FETCH_KEYWORD", "FETCHED").upper()
+API_BASE_URL       = os.environ.get("API_BASE_URL", "").rstrip("/")
+API_TOKEN          = _require("API_TOKEN")
+POLL_INTERVAL      = _int_env("POLL_INTERVAL", 300)
+MESSAGE_CAP        = _int_env("MESSAGE_CAP", 50)
+WORKER_VERSION     = os.environ.get("WORKER_VERSION", "1.0.0")
+WORKER_HTTP_PORT   = _int_env("WORKER_HTTP_PORT", 8080)
+
+_VALID_MODES = ("keyword", "flagged", "seen", "none")
+if IMAP_FETCH_MODE not in _VALID_MODES:
+    log.error("IMAP_FETCH_MODE must be one of %s, got: %r", _VALID_MODES, IMAP_FETCH_MODE)
+    sys.exit(1)
+
+# Auto-derive IMAP search from fetch mode; explicit IMAP_SEARCH overrides.
+_MODE_SEARCH: dict = {
+    "keyword": f"UNKEYWORD {IMAP_FETCH_KEYWORD}",
+    "flagged": "UNFLAGGED",
+    "seen":    "UNSEEN",
+    "none":    "ALL",
+}
+# Custom keywords have no backslash; system flags (\Seen, \Flagged) do.
+_MODE_FLAG: dict = {
+    "keyword": f"({IMAP_FETCH_KEYWORD})",
+    "flagged": r"(\Flagged)",
+    "seen":    r"(\Seen)",
+    "none":    None,
+}
+IMAP_SEARCH  = os.environ.get("IMAP_SEARCH", "").strip() or _MODE_SEARCH[IMAP_FETCH_MODE]
+IMAP_FLAG    = _MODE_FLAG[IMAP_FETCH_MODE]   # None means don't mark
 
 if not API_BASE_URL:
     log.error("Missing required environment variable: API_BASE_URL")
@@ -102,6 +125,7 @@ if not API_BASE_URL:
 
 log.info("worker started")
 log.info("config loaded")
+log.info("fetch mode: %s  search: %s  flag: %s", IMAP_FETCH_MODE, IMAP_SEARCH, IMAP_FLAG or "none")
 log.info("poll interval: %s", POLL_INTERVAL)
 log.info("message cap: %s", MESSAGE_CAP)
 log.info("trigger endpoint: POST http://0.0.0.0:%s/poll", WORKER_HTTP_PORT)
@@ -448,8 +472,11 @@ def poll_once() -> Tuple[int, int, int, Optional[str]]:
                     imported += 1
                 else:
                     skipped += 1
-                if MARK_SEEN:
-                    conn.uid("STORE", str(uid_int).encode(), "+FLAGS", "\\Seen")
+                if IMAP_FLAG:
+                    try:
+                        conn.uid("STORE", str(uid_int).encode(), "+FLAGS", IMAP_FLAG)
+                    except Exception as exc:
+                        log.warning("Could not set flag %s on UID %s: %s", IMAP_FLAG, uid_int, exc)
             else:
                 errors += 1
                 last_error = f"import_error uid={uid_int}"

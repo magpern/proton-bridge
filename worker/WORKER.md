@@ -13,8 +13,9 @@ The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a g
 | `IMAP_USER` | string | ✓ | | Proton address used as IMAP login |
 | `IMAP_PASS` | string | ✓ | | Bridge-generated password (not the Proton account password) |
 | `IMAP_MAILBOX` | string | | `INBOX` | Mailbox to poll |
-| `IMAP_SEARCH` | string | | `UNSEEN` | Any valid IMAP SEARCH expression |
-| `MARK_SEEN` | bool | | `true` | Mark message `\Seen` after a successful import or duplicate response |
+| `IMAP_FETCH_MODE` | string | | `keyword` | How to track imported messages — see below |
+| `IMAP_FETCH_KEYWORD` | string | | `FETCHED` | Custom keyword name (mode `keyword` only) |
+| `IMAP_SEARCH` | string | | *(derived)* | Override auto-derived IMAP search expression |
 | `API_BASE_URL` | string | ✓ | | Base URL of the REST API, no trailing slash |
 | `API_TOKEN` | string | ✓ | | Bearer token sent in every outbound API request and required for `/poll` |
 | `POLL_INTERVAL` | integer | | `300` | Seconds between automatic poll cycles |
@@ -23,6 +24,21 @@ The `mail-worker` is a Python daemon that bridges Proton Mail Bridge IMAP to a g
 | `WORKER_HTTP_PORT` | integer | | `8080` | Port for the built-in trigger HTTP server |
 
 Credentials (`IMAP_PASS`, `API_TOKEN`) are never written to logs.
+
+### Fetch mode
+
+`IMAP_FETCH_MODE` controls both what the worker searches for and what it marks after a successful import. `IMAP_SEARCH` is auto-derived unless explicitly overridden.
+
+| Mode | Search (auto) | Mark after import | Notes |
+|---|---|---|---|
+| `keyword` | `UNKEYWORD FETCHED` | `+FLAGS (FETCHED)` | Custom keyword; test Proton Bridge support before using |
+| `flagged` | `UNFLAGGED` | `+FLAGS (\Flagged)` | Uses the starred/pin flag; always works |
+| `seen` | `UNSEEN` | `+FLAGS (\Seen)` | Risk: Proton mobile app sets `\Seen` when opening mail |
+| `none` | `ALL` | *(nothing)* | Stateless; relies on `imap_dedupe_key` in the API |
+
+`IMAP_FETCH_KEYWORD` sets the keyword name when mode is `keyword` (default: `FETCHED`).
+
+If Proton Bridge does not support custom keywords, the `STORE` command will fail silently (logged as WARNING) and messages will be re-fetched next cycle. Switch to `flagged` in that case.
 
 Startup exits with code 1 if any required variable is missing or if `IMAP_PORT`, `POLL_INTERVAL`, `MESSAGE_CAP`, or `WORKER_HTTP_PORT` is not a valid integer.
 
@@ -329,15 +345,17 @@ A failed heartbeat is logged at WARNING level. The worker continues regardless.
 
 ---
 
-## Mark-seen rules
+## Mark rules
 
-`\Seen` is set via `UID STORE` only when **all** of the following are true:
+The configured flag (`IMAP_FETCH_MODE`) is applied via `UID STORE +FLAGS` only when **all** of the following are true:
 
-1. `MARK_SEEN=true`
+1. `IMAP_FETCH_MODE` is not `none`
 2. The API returned HTTP 2xx
 3. The response body contains `"status": "imported"` or `"status": "skipped_duplicate"`
 
-`\Seen` is **not** set after a parse failure, API 4xx/5xx, timeout, network error, or unexpected status string.
+The flag is **not** set after a parse failure, API 4xx/5xx, timeout, network error, or unexpected status string — leaving the message eligible for retry on the next cycle.
+
+If the `STORE` command itself fails (e.g. Proton Bridge rejects a custom keyword), the error is logged at WARNING level and the cycle continues. Switch `IMAP_FETCH_MODE` to `flagged` if custom keywords are unsupported.
 
 ---
 
